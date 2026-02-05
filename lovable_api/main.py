@@ -23,6 +23,8 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 API_TOKEN = os.environ.get("API_TOKEN", "dev-token")
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 # Lovable-friendly CORS:
 # - Set CORS_ALLOW_ORIGINS="https://your-lovable-app.com,https://another-origin.com"
@@ -133,6 +135,21 @@ def init_db():
           outcome_code text,
           outcome_notes text,
           created_at text
+        );
+
+        create table if not exists business_profiles (
+          id text primary key,
+          lead_id text unique,
+          vertical_category text,
+          services_json text,
+          customer_type text,
+          buyer_persona_hint text,
+          credibility_signals_json text,
+          confidence real,
+          evidence_used_json text,
+          raw_llm_json text,
+          created_at text,
+          updated_at text
         );
         """
     )
@@ -571,6 +588,195 @@ def _strip_html(html: str) -> str:
     return txt
 
 
+BUSINESS_CATEGORIES = [
+    "waterproofing",
+    "window_cleaning",
+    "exterior_painting",
+    "roofing",
+    "hvac",
+    "plumbing",
+    "electrical",
+    "landscaping",
+    "pest_control",
+    "janitorial",
+    "pressure_washing",
+    "concrete",
+    "flooring",
+    "remodeling",
+    "general_contractor",
+    "property_management",
+    "real_estate_services",
+    "moving",
+    "security_services",
+    "other",
+    "unknown",
+]
+
+
+def _bp_default(evidence_used: List[str]) -> Dict[str, Any]:
+    return {
+        "vertical_category": "unknown",
+        "services": [],
+        "customer_type": "unknown",
+        "buyer_persona_hint": None,
+        "credibility_signals": [],
+        "confidence": 0.2 if evidence_used else 0.1,
+        "evidence_used": evidence_used,
+        "raw_llm_json": None,
+    }
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Best-effort: extract first JSON object from a string."""
+    import json as _json
+
+    if not text:
+        return None
+    text = text.strip()
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            return _json.loads(text)
+        except Exception:
+            return None
+    # find first { ... }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        return _json.loads(text[start : end + 1])
+    except Exception:
+        return None
+
+
+def _llm_business_profile(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    """Call OpenAI if configured; otherwise return defaults."""
+    evidence_used = evidence.get("evidence_used") or []
+    if not OPENAI_API_KEY:
+        return _bp_default(evidence_used)
+
+    system = (
+        "You extract a BusinessProfile from provided evidence ONLY. "
+        "Do not guess. If not supported, use 'unknown' and lower confidence. "
+        "Return VALID JSON only (no markdown, no commentary)."
+    )
+
+    user = {
+        "task": "Extract BusinessProfile",
+        "vertical_category_allowed": BUSINESS_CATEGORIES,
+        "schema": {
+            "vertical_category": "string",
+            "services": "string[]",
+            "customer_type": "B2B|B2C|mixed|unknown",
+            "buyer_persona_hint": "string|null",
+            "credibility_signals": "string[]",
+            "confidence": "float 0..1",
+            "evidence_used": "string[]",
+        },
+        "evidence": evidence,
+    }
+
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": OPENAI_MODEL,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(user)},
+                ],
+                "response_format": {"type": "json_object"},
+            },
+            timeout=45,
+        )
+        r.raise_for_status()
+        data = r.json()
+        content = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+        parsed = _extract_json_object(content)
+        if not parsed:
+            out = _bp_default(evidence_used)
+            out["raw_llm_json"] = content[:50_000]
+            return out
+
+        # normalize/guard
+        vc = (parsed.get("vertical_category") or "unknown").strip()
+        if vc not in BUSINESS_CATEGORIES:
+            vc = "unknown"
+        conf = parsed.get("confidence")
+        try:
+            conf_f = float(conf)
+        except Exception:
+            conf_f = 0.2
+        conf_f = max(0.0, min(1.0, conf_f))
+
+        return {
+            "vertical_category": vc,
+            "services": [str(x) for x in (parsed.get("services") or [])][:50],
+            "customer_type": (parsed.get("customer_type") or "unknown"),
+            "buyer_persona_hint": parsed.get("buyer_persona_hint"),
+            "credibility_signals": [str(x) for x in (parsed.get("credibility_signals") or [])][:50],
+            "confidence": conf_f,
+            "evidence_used": [str(x) for x in (parsed.get("evidence_used") or evidence_used)],
+            "raw_llm_json": content[:50_000],
+        }
+    except Exception as e:
+        out = _bp_default(evidence_used)
+        out["raw_llm_json"] = f"error: {type(e).__name__}: {str(e)[:400]}"
+        return out
+
+
+def upsert_business_profile(lead_id: str, bp: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist BusinessProfile (1:1 with lead)."""
+    conn = db()
+    row = conn.execute("select id from business_profiles where lead_id=?", (lead_id,)).fetchone()
+    now = now_iso()
+    if row:
+        bp_id = row["id"]
+        conn.execute(
+            "update business_profiles set vertical_category=?, services_json=?, customer_type=?, buyer_persona_hint=?, credibility_signals_json=?, confidence=?, evidence_used_json=?, raw_llm_json=?, updated_at=? where lead_id=?",
+            (
+                bp.get("vertical_category"),
+                json.dumps(bp.get("services") or []),
+                bp.get("customer_type"),
+                bp.get("buyer_persona_hint"),
+                json.dumps(bp.get("credibility_signals") or []),
+                float(bp.get("confidence") or 0.0),
+                json.dumps(bp.get("evidence_used") or []),
+                json.dumps(bp.get("raw_llm_json")) if isinstance(bp.get("raw_llm_json"), (dict, list)) else (bp.get("raw_llm_json") or ""),
+                now,
+                lead_id,
+            ),
+        )
+    else:
+        bp_id = f"bp_{uuid.uuid4().hex}"
+        conn.execute(
+            "insert into business_profiles (id, lead_id, vertical_category, services_json, customer_type, buyer_persona_hint, credibility_signals_json, confidence, evidence_used_json, raw_llm_json, created_at, updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                bp_id,
+                lead_id,
+                bp.get("vertical_category"),
+                json.dumps(bp.get("services") or []),
+                bp.get("customer_type"),
+                bp.get("buyer_persona_hint"),
+                json.dumps(bp.get("credibility_signals") or []),
+                float(bp.get("confidence") or 0.0),
+                json.dumps(bp.get("evidence_used") or []),
+                json.dumps(bp.get("raw_llm_json")) if isinstance(bp.get("raw_llm_json"), (dict, list)) else (bp.get("raw_llm_json") or ""),
+                now,
+                now,
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+    bp_out = dict(bp)
+    bp_out["id"] = bp_id
+    bp_out["lead_id"] = lead_id
+    return bp_out
+
+
 def _score_stub(lead: Dict[str, Any], criteria: Dict[str, Any]) -> Tuple[int, str, List[str], Dict[str, Any]]:
     """Deterministic stub: location>size>industry. Replace with real scorer later."""
     seed = lead.get("seed", {})
@@ -763,6 +969,54 @@ def _runner(campaign_run_id: str):
                 "lead.website_enriched",
                 "Website enriched",
                 {"sample_len": len(text)},
+                lead_id=lead_id,
+            )
+
+        # Extract BusinessProfile (AI) after enrichment
+        try:
+            # Build evidence payload from what we have
+            evidence_used: List[str] = []
+            seed_desc = (seed.get("business_description") or "").strip()
+            if seed_desc:
+                evidence_used.append("seed_description")
+            if places:
+                evidence_used.append("google_places")
+            if text:
+                evidence_used.append("website_page")
+
+            evidence_payload = {
+                "evidence_used": evidence_used,
+                "seed": {
+                    "business_name": seed.get("business_name"),
+                    "city": seed.get("city"),
+                    "state": seed.get("state"),
+                    "business_description": seed_desc[:2000],
+                },
+                "google_places": (lead.get("business") or {}).get("google"),
+                "website_sample": (text[:2500] if text else ""),
+            }
+
+            bp_core = _llm_business_profile(evidence_payload)
+            bp_saved = upsert_business_profile(lead_id, bp_core)
+            lead["business_profile"] = bp_saved
+
+            emit_event(
+                campaign_run_id,
+                "lead.business_profile_extracted",
+                "BusinessProfile extracted",
+                {"vertical_category": bp_saved.get("vertical_category"), "confidence": bp_saved.get("confidence")},
+                lead_id=lead_id,
+            )
+        except Exception as e:
+            # Do not fail pipeline
+            prog["errors"] = int(prog.get("errors") or 0) + 1
+            bp_saved = upsert_business_profile(lead_id, _bp_default([]))
+            lead["business_profile"] = bp_saved
+            emit_event(
+                campaign_run_id,
+                "lead.business_profile_error",
+                "BusinessProfile extraction error; defaulted",
+                {"error": f"{type(e).__name__}: {str(e)[:200]}"},
                 lead_id=lead_id,
             )
 
@@ -1047,6 +1301,7 @@ def list_leads(campaign_run_id: str, tier: Optional[str] = None, sort: str = "sc
         if tr:
             next_task = {"task_id": tr["id"], "type": tr["type"], "due_at_est": tr["due_at_est"]}
 
+        bp = lj.get("business_profile") or {}
         leads_out.append(
             {
                 "id": r["id"],
@@ -1058,6 +1313,9 @@ def list_leads(campaign_run_id: str, tier: Optional[str] = None, sort: str = "sc
                 "employees": (lj.get("business") or {}).get("employee_count"),
                 "score_total": r["score_total"],
                 "tier": r["tier"],
+                # BusinessProfile summary fields for Lovable list UI
+                "vertical_category": bp.get("vertical_category"),
+                "profile_confidence": bp.get("confidence"),
                 "top_reasons": reasons[:3],
                 "next_task": next_task,
             }

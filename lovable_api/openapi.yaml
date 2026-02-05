@@ -60,6 +60,8 @@ components:
         employees: { type: integer }
         score_total: { type: integer }
         tier: { type: string }
+        vertical_category: { type: string, nullable: true }
+        profile_confidence: { type: number, nullable: true }
         top_reasons:
           type: array
           items: { type: string }
