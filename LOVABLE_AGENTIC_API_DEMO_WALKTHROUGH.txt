@@ -1,0 +1,445 @@
+Lovable Agentic API (POC)
+Demo Walkthrough + How It Works (for Lovable UI build)
+
+Audience
+- Marc + Lovable builder (you). Technical but “demo-friendly”.
+
+What this application is
+- A small FastAPI backend that:
+  1) accepts an UPLOADED seed CSV of leads (exported from your campaign builder)
+  2) normalizes it into a consistent Lead model
+  3) runs a pipeline (enrich → score → tier → generate tasks)
+  4) emits live progress events (polling or SSE)
+  5) exposes read APIs for the Lovable dashboard (runs, leads, tasks, metrics)
+  6) allows a lightweight “admin” workflow to update task status and track completion
+
+Purpose / the demo story
+- You can demo an end-to-end agentic “qualification + enrichment + ranking + explainability + task generation” layer:
+  - Upload leads → watch progress live → view ranked leads with reasons → view generated outreach tasks → mark tasks done → see metrics update.
+
+Important safety/ethics constraint
+- This POC is designed to work from business/public info.
+- It should NOT be used for doxxing or private-life/stalking enrichment.
+
+
+1) Deployment & Access
+
+Hosted URL (Render)
+- Base: https://lovable-agentic-api.onrender.com
+
+Authentication
+- All endpoints (except SSE auth is handled manually) require:
+  Authorization: Bearer <API_TOKEN>
+
+Note on intermittent 502s
+- Render edge can sometimes show HTML “502 Bad Gateway” during deploys/cold starts.
+- If you get 502, retry after ~30–60s. If you get JSON (401/200), the app is reachable.
+
+
+2) Data model overview
+
+2.1 CampaignRun
+A CampaignRun is the unit of work for a single uploaded CSV + pipeline execution.
+Key fields:
+- id: cr_<uuid>
+- name: display name
+- status: draft | running | paused | complete | failed
+- criteria: freeform campaign criteria (strings)
+- progress: counters (seed_rows_total, leads_created, leads_scored, tasks_created, …)
+- created_at / updated_at
+
+2.2 Lead
+A Lead is the normalized object created from each CSV row.
+Key pieces:
+- seed: raw-ish normalized seed row fields
+- business: name, website, employee_count, address{city,state}, optional google fields
+- owner: full_name, emails[] (seed email marked status="valid")
+- evidence: sources[] (e.g., google_places, website_page)
+- score: total/tier/components/reasoning_bullets
+- task_ids: list of generated task ids
+
+2.3 Task
+A Task represents an intended action to take (planning).
+Key fields:
+- type: e.g., email_1, call_1
+- channel: email | phone
+- status: scheduled | todo | done (POC uses scheduled/done primarily)
+- due_at_est: ISO datetime string (stored as text)
+- instructions: what to do
+- template_id: references an outreach template
+- completion: { completed_at, outcome_code, outcome_notes }
+
+2.4 OutreachAttempt (execution record)
+An OutreachAttempt represents what actually happened (execution), separate from Tasks.
+- One lead can have many OutreachAttempts.
+- Logging an attempt does NOT modify or replace Tasks.
+Fields:
+- id: oa_<uuid>
+- campaign_run_id
+- lead_id
+- channel: email | phone | linkedin | other
+- template_id: nullable
+- executed_at: ISO timestamp
+- outcome_code: sent | delivered | replied | positive | negative | meeting_booked | bounced | unsubscribed
+- outcome_notes: nullable text
+
+2.5 Event
+Events are emitted during the pipeline (and when logging execution attempts).
+Used to power:
+- live progress indicator
+- activity feed
+- debugging
+
+
+3) CSV integration (Upload → Normalization)
+
+3.1 Upload mechanism
+- The CSV is uploaded via multipart/form-data:
+  POST /v1/campaign-runs/{id}/import/seed-csv
+  form field: file=@/path/to/file.csv
+
+3.2 Required CSV columns (exact header text)
+The server validates these headers strictly:
+- Contact Name
+- Email
+- Business Name
+- Business Description
+- Website
+- Status
+- Last Email Date
+- Employees
+- City
+- State
+
+If any are missing, import fails with HTTP 400.
+
+3.3 Mapping from CSV to Lead
+Each row becomes one Lead with:
+- seed.contact_name      <- Contact Name
+- seed.email             <- Email
+- seed.business_name     <- Business Name
+- seed.business_description <- Business Description
+- seed.website           <- Website
+- seed.status            <- Status
+- seed.last_email_date   <- Last Email Date (or null)
+- seed.employees         <- Employees (int)
+- seed.city              <- City
+- seed.state             <- State
+
+Owner email handling (important demo point)
+- seed email is treated as already validated:
+  lead.owner.emails[0].status = "valid"
+
+
+4) Pipeline stages (what happens when you hit /run)
+
+The pipeline is implemented in lovable_api/main.py as a background thread runner.
+
+4.1 Start run
+- POST /v1/campaign-runs/{id}/run
+- This starts a daemon thread. The response returns immediately.
+
+Rerun safety (recent fix)
+- If status is "running": HTTP 409 (prevents concurrent runs and inflated counters)
+- If status is "complete": HTTP 409 unless force=true
+- To force a rerun (rarely needed):
+  POST /v1/campaign-runs/{id}/run?force=true
+
+4.2 Progress counters (and how to explain them)
+At run start, progress counters are reset for that attempt:
+- leads_enriched_places = 0
+- leads_enriched_website = 0
+- leads_scored = 0
+- tasks_created = 0
+- errors = 0
+
+seed_rows_total and leads_created remain as imported.
+
+Important: This does not delete old events/tasks; for a pristine demo run history, create a new CampaignRun.
+
+4.3 Enrichment: Google Places (optional, but demo-friendly)
+Function: _places_lookup
+- Runs ONLY if GOOGLE_MAPS_API_KEY is set.
+- Emits a run-level progress payload with:
+  - places_enabled: true/false
+  - places_cache_ttl_days (default 30)
+- Does a text search + details fetch, then caches results in SQLite (places_cache) for ~30 days.
+  - This reduces rate-limit risk and makes demos stable.
+- Adds to Lead.business.google:
+  - place_id, maps_url, rating, reviews, types
+  - phone, website, formatted_address
+  - latlng (optional)
+  - hours_local (optional)
+- Adds an evidence source of type google_places with a short field summary.
+
+Demo framing:
+- “Places enrichment is enabled when we provide a Google Maps API key. We also cache results so the demo stays fast and consistent.”
+
+4.4 Enrichment: Website fetch (POC)
+Function: _website_fetch + _strip_html
+- Attempts to HTTP GET the seed website URL (homepage), strips HTML to text.
+- Adds evidence source of type website_page with a short snippet.
+
+Demo framing:
+- “We can pull lightweight website signals without crawling. This is a POC, not a full crawler.”
+
+4.5 LLM extraction (planned)
+- In this POC, extractions are present as a field but are not truly LLM-driven.
+- Future: extract industry, services, credibility signals, etc.
+
+4.6 Scoring and tiering (deterministic stub)
+Function: _score_stub
+Priority order (matches our product intent):
+1) Location (0–50)
+2) Size (0–30) using Employees
+3) Industry (0–20) keyword match
+
+Tier mapping:
+- A: total >= 80
+- B: total >= 65
+- C: total >= 50
+- D: else
+
+Explainability
+- Each lead gets reasoning_bullets, and the list endpoint shows top_reasons.
+
+4.7 Task generation
+Function: _generate_tasks_stub
+- For each eligible lead, creates tasks like:
+  - email_1 (template: E1_MANDATE_SALEONLY)
+  - call_1  (template: CALL_VERIFY)
+
+Rules:
+- By default, tasks are created for tier A/B.
+
+Fallback behavior (key demo feature)
+- If no A/B tasks are created, the POC creates tasks for top N leads anyway.
+- Controlled by env var:
+  TASK_TOP_N (default 25)
+- The fallback emits events with payload.reason = "fallback_top_n".
+
+
+5) API surface (what Lovable should call)
+
+All endpoints require Authorization: Bearer <API_TOKEN>
+
+5.1 Campaign runs
+- POST /v1/campaign-runs
+  Creates a CampaignRun.
+
+- GET /v1/campaign-runs/{id}
+  Returns run status + progress.
+
+- POST /v1/campaign-runs/{id}/import/seed-csv
+  Upload seed CSV.
+
+- POST /v1/campaign-runs/{id}/run
+  Starts pipeline.
+  - 200 when started
+  - 409 if already running
+  - 409 if complete (unless force=true)
+
+5.2 Events (live progress)
+Two options:
+- GET /v1/campaign-runs/{id}/events
+  Polling. Returns {events[], nextCursor}
+
+- GET /v1/campaign-runs/{id}/events/stream
+  SSE stream for near-real-time UI.
+
+Event types you’ll see in practice:
+- progress (campaign created/imported/run started/progress reset/run complete)
+- lead.places_enriched
+- lead.website_enriched
+- lead.scored
+- lead.tasks_created
+- task.completed
+
+5.3 Leads
+- GET /v1/campaign-runs/{id}/leads
+  Query params:
+  - tier= A,B,C (comma-separated)
+  - sort=score_desc|score_asc
+  - limit, cursor
+
+- GET /v1/leads/{leadId}
+  Lead detail.
+
+5.4 Tasks
+- GET /v1/tasks
+  Query params:
+  - campaign_run_id
+  - status (comma-separated)
+  - due_before
+  - limit
+
+- PATCH /v1/tasks/{taskId}
+  Update status and/or completion.
+  When status becomes "done", the API increments tasks_completed and emits task.completed event.
+
+5.5 OutreachAttempts (execution logging)
+- POST /v1/outreach-attempts
+  Log what actually happened (email sent, reply received, bounced, meeting booked, etc.).
+  Emits event: attempt.logged
+
+- GET /v1/outreach-attempts
+  Query params:
+  - campaign_run_id
+  - lead_id
+  - limit
+
+5.5 Metrics
+- GET /v1/metrics/overview
+  Returns:
+  - leads_total
+  - tiers {A,B,C,D}
+  - tasks_total
+  - tasks_done
+  - task_completion_rate
+
+
+6) Lovable frontend: recommended screens/components
+
+6.1 “Campaign Runs” page
+Goal: list runs and let user create/start a run.
+Components:
+- Create run form: name + criteria (free text)
+- Runs table:
+  - name, status, created_at, leads_created, leads_scored, tasks_created
+  - button: View
+
+6.2 “Run Detail” page
+Goal: the main demo page.
+Layout idea:
+A) Header
+- run name, run id, status badge
+- progress summary: scored/enriched/tasks/errors
+
+B) Live progress
+- Poll /v1/campaign-runs/{id} every 2s OR subscribe to SSE.
+- Optional “Activity feed” from /events.
+
+C) Lead leaderboard
+- Table from /campaign-runs/{id}/leads?sort=score_desc
+Columns:
+- business_name, city/state, employees
+- owner_email
+- score_total, tier
+- top_reasons (3 bullets)
+- next_task (if any)
+Actions:
+- open lead detail
+
+D) Tasks preview
+- show tasks for this campaign: /tasks?campaign_run_id=<id>
+- filter by status
+
+6.3 “Lead Detail” page
+Goal: explainability and enrichment evidence.
+- seed fields (what we imported)
+- evidence sources (Google/website)
+- score breakdown (components)
+- tasks for this lead
+
+6.4 “Tasks Admin” page
+Goal: assign and track tasks (no rep assignment required yet).
+- List tasks (campaign_run filter + status filter)
+- Bulk actions:
+  - mark done
+  - update outcome_notes
+
+Implementation detail:
+- PATCH /v1/tasks/{taskId}
+  body example:
+  {
+    "status": "done",
+    "completion": {
+      "completed_at": "2026-02-05T15:02:00Z",
+      "outcome_code": "sent",
+      "outcome_notes": "Sent intro email"
+    }
+  }
+
+6.5 Metrics page
+Goal: lightweight reporting.
+- call /v1/metrics/overview?campaign_run_id=<id>
+- show:
+  - leads_total
+  - tier distribution
+  - tasks_done / tasks_total
+  - completion rate
+
+
+7) Demo script (what to show in order)
+
+A) Setup
+- Explain: “We ingest a validated-email lead export (CSV).”
+
+B) Create CampaignRun
+- In Lovable: enter name + criteria.
+- Call POST /v1/campaign-runs.
+
+C) Upload CSV
+- Lovable file upload -> POST /import/seed-csv.
+- Confirm imported count.
+
+D) Start pipeline
+- Click Start -> POST /run.
+- Show live updating counters.
+- Show events feed (optional).
+
+E) Show ranked leads
+- Show top leads with “why” bullets.
+
+F) Show tasks created
+- Show tasks list.
+- Mention fallback: even if A/B is empty, we still create tasks for top N so the workflow proceeds.
+
+G) Admin marks tasks done
+- Toggle some tasks to done.
+- Show metrics update and task.completed events.
+
+
+8) Known limitations / POC notes (be explicit in demo)
+
+- Scoring is a deterministic stub (location/size/industry). It’s intentionally simple and explainable.
+- Google Places enrichment requires GOOGLE_MAPS_API_KEY. Without it, places enrichment is skipped.
+- Website enrichment is a single-page fetch; not a crawler.
+- No true LLM extraction in the POC.
+- SQLite is used for persistence (DB_PATH env var; Render uses a disk path like /var/data/poc.db).
+- Render may occasionally 502 during deploy/cold starts; retry.
+- For clean progress reporting, use a fresh CampaignRun per demo.
+
+
+9) Appendix: Quick cURL examples
+
+Set env vars in your shell (example):
+- export BASE=https://lovable-agentic-api.onrender.com
+- export TOKEN=... (API token)
+
+Create run:
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"Demo","criteria":{"locations_text":"FL","size_text":"10-200 employees"}}' \
+  "$BASE/v1/campaign-runs"
+
+Import CSV:
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+  -F "file=@/home/curl/.openclaw/workspace/new-claw-fixed.csv" \
+  "$BASE/v1/campaign-runs/<RUN_ID>/import/seed-csv"
+
+Run:
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" "$BASE/v1/campaign-runs/<RUN_ID>/run"
+
+List leads:
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/campaign-runs/<RUN_ID>/leads?limit=10&sort=score_desc"
+
+List tasks:
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/tasks?campaign_run_id=<RUN_ID>&limit=10"
+
+Mark task done:
+curl -sS -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"status":"done","completion":{"completed_at":"2026-02-05T15:00:00Z","outcome_code":"sent","outcome_notes":"Sent"}}' \
+  "$BASE/v1/tasks/<TASK_ID>"
+
+Metrics:
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/metrics/overview?campaign_run_id=<RUN_ID>"
