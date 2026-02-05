@@ -1210,7 +1210,11 @@ def patch_task(task_id: str, body: Dict[str, Any]):
 
 @app.get("/v1/metrics/overview", dependencies=[Depends(auth)])
 def metrics_overview(campaign_run_id: Optional[str] = None):
-    # minimal POC metrics
+    """Overview metrics for dashboards.
+
+    Keeps existing fields stable and adds execution/outcome metrics derived from OutreachAttempts.
+    """
+
     conn = db()
     params: List[Any] = []
     where = ""
@@ -1218,23 +1222,76 @@ def metrics_overview(campaign_run_id: Optional[str] = None):
         where = " where campaign_run_id=?"
         params.append(campaign_run_id)
 
+    # ---- Task metrics ----
     total_tasks = conn.execute(f"select count(*) as c from tasks{where}", tuple(params)).fetchone()["c"]
-    done_tasks = conn.execute(f"select count(*) as c from tasks{where} and status='done'", tuple(params)).fetchone()["c"] if where else conn.execute("select count(*) as c from tasks where status='done'").fetchone()["c"]
+    done_tasks = (
+        conn.execute(f"select count(*) as c from tasks{where} and status='done'", tuple(params)).fetchone()["c"]
+        if where
+        else conn.execute("select count(*) as c from tasks where status='done'").fetchone()["c"]
+    )
 
+    # ---- Lead metrics ----
     total_leads = conn.execute(f"select count(*) as c from leads{where}", tuple(params)).fetchone()["c"]
-    tier_counts = {}
+    tier_counts: Dict[str, int] = {}
     for t in ["A", "B", "C", "D"]:
         if where:
-            tier_counts[t] = conn.execute(f"select count(*) as c from leads where campaign_run_id=? and tier=?", (campaign_run_id, t)).fetchone()["c"]
+            tier_counts[t] = conn.execute(
+                "select count(*) as c from leads where campaign_run_id=? and tier=?",
+                (campaign_run_id, t),
+            ).fetchone()["c"]
         else:
             tier_counts[t] = conn.execute("select count(*) as c from leads where tier=?", (t,)).fetchone()["c"]
+
+    # ---- OutreachAttempt metrics ----
+    attempts_total = conn.execute(f"select count(*) as c from outreach_attempts{where}", tuple(params)).fetchone()["c"]
+
+    # attempts by channel
+    attempts_by_channel: Dict[str, int] = {"email": 0, "phone": 0, "linkedin": 0, "other": 0}
+    ch_rows = conn.execute(
+        f"select channel, count(*) as c from outreach_attempts{where} group by channel",
+        tuple(params),
+    ).fetchall()
+    for r in ch_rows:
+        attempts_by_channel[r["channel"]] = r["c"]
+
+    reply_codes = ("replied", "positive", "negative", "meeting_booked")
+    replies_total = conn.execute(
+        f"select count(*) as c from outreach_attempts{where} and outcome_code in (?,?,?,?)" if where else "select count(*) as c from outreach_attempts where outcome_code in (?,?,?,?)",
+        tuple(params + list(reply_codes)) if where else reply_codes,
+    ).fetchone()["c"]
+
+    positive_codes = ("positive", "meeting_booked")
+    positive_replies_total = conn.execute(
+        f"select count(*) as c from outreach_attempts{where} and outcome_code in (?,?)" if where else "select count(*) as c from outreach_attempts where outcome_code in (?,?)",
+        tuple(params + list(positive_codes)) if where else positive_codes,
+    ).fetchone()["c"]
+
+    meetings_total = conn.execute(
+        f"select count(*) as c from outreach_attempts{where} and outcome_code='meeting_booked'" if where else "select count(*) as c from outreach_attempts where outcome_code='meeting_booked'",
+        tuple(params) if where else (),
+    ).fetchone()["c"]
+
+    bounces_total = conn.execute(
+        f"select count(*) as c from outreach_attempts{where} and outcome_code='bounced'" if where else "select count(*) as c from outreach_attempts where outcome_code='bounced'",
+        tuple(params) if where else (),
+    ).fetchone()["c"]
+
+    bounce_rate = (bounces_total / attempts_total) if attempts_total else 0.0
 
     conn.close()
 
     return {
+        # existing fields
         "leads_total": total_leads,
         "tiers": tier_counts,
         "tasks_total": total_tasks,
         "tasks_done": done_tasks,
         "task_completion_rate": (done_tasks / total_tasks) if total_tasks else 0.0,
+        # new execution fields
+        "attempts_total": attempts_total,
+        "attempts_by_channel": attempts_by_channel,
+        "replies_total": replies_total,
+        "positive_replies_total": positive_replies_total,
+        "meetings_total": meetings_total,
+        "bounce_rate": bounce_rate,
     }
