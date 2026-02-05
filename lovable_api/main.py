@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
@@ -167,8 +168,47 @@ def init_db():
           safety_checks_passed integer,
           created_at text
         );
+
+        create table if not exists tactics (
+          id text primary key,
+          campaign_run_id text,
+          name text,
+          description text,
+          channels_json text,
+          target_segment_json text,
+          hypothesis text,
+          pattern_json text,
+          created_by text,
+          status text,
+          created_at text,
+          updated_at text
+        );
+
+        create table if not exists experiments (
+          id text primary key,
+          campaign_run_id text,
+          tactic_id text,
+          allocation_pct integer,
+          started_at text,
+          ended_at text,
+          metrics_snapshot_json text,
+          status text
+        );
         """
     )
+
+    def _ensure_column(table: str, column: str, coltype: str):
+        cols = [r["name"] for r in conn.execute(f"pragma table_info({table})").fetchall()]
+        if column in cols:
+            return
+        conn.execute(f"alter table {table} add column {column} {coltype}")
+
+    # Lightweight migrations for new attribution columns
+    _ensure_column("tasks", "tactic_id", "text")
+    _ensure_column("tasks", "experiment_id", "text")
+    _ensure_column("outreach_attempts", "tactic_id", "text")
+    _ensure_column("outreach_attempts", "experiment_id", "text")
+
     conn.commit()
     conn.close()
 
@@ -239,6 +279,9 @@ class OutreachAttemptCreate(BaseModel):
     executed_at: str
     outcome_code: str  # sent|delivered|replied|positive|negative|meeting_booked|bounced|unsubscribed
     outcome_notes: Optional[str] = None
+    # Attribution (optional for now)
+    tactic_id: Optional[str] = None
+    experiment_id: Optional[str] = None
 
 
 app = FastAPI(title="Lovable Agentic API (POC)")
@@ -1635,6 +1678,22 @@ def _runner(campaign_run_id: str):
 
         # MessageDrafts + Tasks for A/B
         if tier in ("A", "B"):
+            # Experiment allocation (campaign-level activation, lead-level assignment)
+            exp = _active_experiment_for_campaign(campaign_run_id)
+            tactic_id = None
+            experiment_id = None
+            email_template_id = "E1_MANDATE_SALEONLY"
+            if exp and exp.get("status") == "active" and exp.get("tactic"):
+                seg = (exp.get("tactic") or {}).get("target_segment") or {}
+                if _lead_matches_segment(lead, seg):
+                    pct = int(exp.get("allocation_pct") or 0)
+                    if _stable_bucket_0_99(lead_id) < max(0, min(100, pct)):
+                        tactic_id = (exp.get("tactic") or {}).get("id")
+                        experiment_id = exp.get("id")
+                        pat = (exp.get("tactic") or {}).get("pattern") or {}
+                        if isinstance(pat, dict) and pat.get("email_template_id"):
+                            email_template_id = str(pat.get("email_template_id"))
+
             # Generate at least 1 email draft (idempotent-ish)
             try:
                 conn = db()
@@ -1648,7 +1707,7 @@ def _runner(campaign_run_id: str):
                     seed = lead.get("seed", {})
                     md_payload = {
                         "channel": "email",
-                        "template_id": "E1_MANDATE_SALEONLY",
+                        "template_id": email_template_id,
                         "criteria": criteria,
                         "business_profile": lead.get("business_profile") or {},
                         "seed": {
@@ -1669,7 +1728,7 @@ def _runner(campaign_run_id: str):
                             campaign_run_id=campaign_run_id,
                             lead_id=lead_id,
                             channel="email",
-                            template_id="E1_MANDATE_SALEONLY",
+                            template_id=email_template_id,
                             subject=str(md.get("subject") or "").strip(),
                             body=str(md.get("body") or "").strip(),
                             personalization_facts=[str(x) for x in (md.get("personalization_facts") or [])],
@@ -1679,7 +1738,7 @@ def _runner(campaign_run_id: str):
                             campaign_run_id,
                             "lead.message_draft_created",
                             "Message draft created",
-                            {"draft_id": saved.get("id"), "channel": "email", "template_id": "E1_MANDATE_SALEONLY", "safety_checks_passed": saved.get("safety_checks_passed")},
+                            {"draft_id": saved.get("id"), "channel": "email", "template_id": email_template_id, "safety_checks_passed": saved.get("safety_checks_passed"), "tactic_id": tactic_id, "experiment_id": experiment_id},
                             lead_id=lead_id,
                         )
                     else:
@@ -1713,8 +1772,11 @@ def _runner(campaign_run_id: str):
                 for t in tasks:
                     tid = f"tsk_{uuid.uuid4().hex}"
                     task_ids.append(tid)
+                    tpl = t.get("template_id")
+                    if str(t.get("channel")) == "email":
+                        tpl = email_template_id
                     conn.execute(
-                        "insert into tasks (id,campaign_run_id,lead_id,type,channel,status,due_at_est,window_start_est,window_end_est,instructions,template_id,completion_json,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "insert into tasks (id,campaign_run_id,lead_id,type,channel,status,due_at_est,window_start_est,window_end_est,instructions,template_id,tactic_id,experiment_id,completion_json,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             tid,
                             campaign_run_id,
@@ -1726,7 +1788,9 @@ def _runner(campaign_run_id: str):
                             t.get("window_start_est"),
                             t.get("window_end_est"),
                             t.get("instructions"),
-                            t.get("template_id"),
+                            tpl,
+                            tactic_id,
+                            experiment_id,
                             json.dumps({"completed_at": None, "outcome_code": None, "outcome_notes": None}),
                             now_iso(),
                             now_iso(),
@@ -2189,6 +2253,330 @@ def generate_message_drafts(campaign_run_id: str, tier: str = "A,B", limit: int 
     return {"campaign_run_id": campaign_run_id, "created": created, "skipped": skipped, "considered": len(rows)}
 
 
+# --- Tactics + Experiments (Campaign intelligence loop) ---
+
+_ALLOWED_TACTIC_CHANNELS = {"email", "phone"}
+_DENYLIST_TACTIC_TERMS = [
+    "scrape",
+    "scraping",
+    "pretend",
+    "impersonate",
+    "deceptive",
+    "facebook",
+    "instagram",
+    "tiktok",
+    "personal social",
+    "dox",
+]
+
+
+def _stable_bucket_0_99(key: str) -> int:
+    h = hashlib.md5(key.encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % 100
+
+
+def _active_experiment_for_campaign(campaign_run_id: str) -> Optional[Dict[str, Any]]:
+    conn = db()
+    row = conn.execute(
+        "select * from experiments where campaign_run_id=? and status='active' order by started_at desc limit 1",
+        (campaign_run_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    exp = dict(row)
+    # attach tactic
+    conn = db()
+    tr = conn.execute("select * from tactics where id=?", (row["tactic_id"],)).fetchone()
+    conn.close()
+    tactic = dict(tr) if tr else None
+    if tactic:
+        exp["tactic"] = {
+            "id": tactic.get("id"),
+            "name": tactic.get("name"),
+            "description": tactic.get("description"),
+            "channels": json.loads(tactic.get("channels_json") or "[]"),
+            "target_segment": json.loads(tactic.get("target_segment_json") or "{}"),
+            "hypothesis": tactic.get("hypothesis"),
+            "pattern": json.loads(tactic.get("pattern_json") or "{}"),
+            "status": tactic.get("status"),
+        }
+    return exp
+
+
+def _lead_matches_segment(lead: Dict[str, Any], segment: Dict[str, Any]) -> bool:
+    if not segment:
+        return True
+    score = lead.get("score") or {}
+    bp = lead.get("business_profile") or {}
+    tier = score.get("tier")
+    vc = bp.get("vertical_category")
+
+    if "tier" in segment:
+        allowed = segment.get("tier") or []
+        if isinstance(allowed, str):
+            allowed = [allowed]
+        if allowed and tier not in allowed:
+            return False
+
+    if "vertical_category" in segment:
+        allowed = segment.get("vertical_category") or []
+        if isinstance(allowed, str):
+            allowed = [allowed]
+        if allowed and vc not in allowed:
+            return False
+
+    return True
+
+
+def _sanitize_tactic_proposal(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    name = str(t.get("name") or "").strip()[:120]
+    desc = str(t.get("description") or "").strip()[:800]
+    hypothesis = str(t.get("hypothesis") or "").strip()[:800]
+
+    blob = f"{name} {desc} {hypothesis}".lower()
+    if any(term in blob for term in _DENYLIST_TACTIC_TERMS):
+        return None
+
+    channels = t.get("channels") or []
+    if isinstance(channels, str):
+        channels = [channels]
+    channels = [str(c).strip() for c in channels if str(c).strip()]
+    channels = [c for c in channels if c in _ALLOWED_TACTIC_CHANNELS]
+    if not channels:
+        channels = ["email"]
+
+    segment = t.get("target_segment") or {}
+    if not isinstance(segment, dict):
+        segment = {}
+
+    pattern = t.get("pattern") or {}
+    if not isinstance(pattern, dict):
+        pattern = {}
+
+    return {
+        "name": name or "Tactic",
+        "description": desc or "",
+        "hypothesis": hypothesis or "",
+        "channels": channels,
+        "target_segment": segment,
+        "pattern": pattern,
+    }
+
+
+def _llm_generate_tactics(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not OPENAI_API_KEY:
+        return []
+
+    system = (
+        "You propose outreach tactics for a B2B campaign. "
+        "Return STRICT JSON only. Do not propose spammy or deceptive tactics. "
+        "Only use allowed channels: email, phone."
+    )
+
+    user = {
+        "task": "Propose 3-5 new outreach tactics",
+        "allowed_channels": ["email", "phone"],
+        "schema": {
+            "tactics": [
+                {
+                    "name": "string",
+                    "description": "string",
+                    "channels": "string[]",
+                    "target_segment": "object (e.g. {tier:[A], vertical_category:[pest_control]})",
+                    "hypothesis": "string",
+                    "pattern": "object (e.g. {email_template_id: string, angle: string})",
+                }
+            ]
+        },
+        "input": payload,
+    }
+
+    last_err: Optional[str] = None
+    for attempt in range(OPENAI_MAX_RETRIES):
+        _openai_throttle()
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": OPENAI_MODEL,
+                "temperature": 0.4,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(user)},
+                ],
+                "response_format": {"type": "json_object"},
+            },
+            timeout=60,
+        )
+        if r.status_code == 429:
+            time.sleep(min(8.0, 0.75 * (2**attempt)))
+            last_err = "429"
+            continue
+        if r.status_code >= 400:
+            last_err = (r.text or "")[:200]
+            break
+        data = r.json()
+        content = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+        parsed = _extract_json_object(content) or {}
+        tactics = parsed.get("tactics") or []
+        if not isinstance(tactics, list):
+            return []
+        return tactics[:5]
+
+    return []
+
+
+def _create_tactic(campaign_run_id: str, t: Dict[str, Any], created_by: str = "ai", status: str = "proposed") -> Dict[str, Any]:
+    tid = f"tc_{uuid.uuid4().hex}"
+    now = now_iso()
+    conn = db()
+    conn.execute(
+        "insert into tactics (id,campaign_run_id,name,description,channels_json,target_segment_json,hypothesis,pattern_json,created_by,status,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            tid,
+            campaign_run_id,
+            t.get("name"),
+            t.get("description"),
+            json.dumps(t.get("channels") or []),
+            json.dumps(t.get("target_segment") or {}),
+            t.get("hypothesis"),
+            json.dumps(t.get("pattern") or {}),
+            created_by,
+            status,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return {"id": tid, "campaign_run_id": campaign_run_id, **t, "created_by": created_by, "status": status, "created_at": now, "updated_at": now}
+
+
+def _list_tactics(campaign_run_id: str) -> List[Dict[str, Any]]:
+    conn = db()
+    rows = conn.execute("select * from tactics where campaign_run_id=? order by created_at desc", (campaign_run_id,)).fetchall()
+    conn.close()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "id": r["id"],
+                "campaign_run_id": r["campaign_run_id"],
+                "name": r["name"],
+                "description": r["description"],
+                "channels": json.loads(r["channels_json"] or "[]"),
+                "target_segment": json.loads(r["target_segment_json"] or "{}"),
+                "hypothesis": r["hypothesis"],
+                "pattern": json.loads(r["pattern_json"] or "{}"),
+                "created_by": r["created_by"],
+                "status": r["status"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            }
+        )
+    return out
+
+
+@app.get("/v1/tactics", dependencies=[Depends(auth)])
+def list_tactics(campaign_run_id: str):
+    _ = get_campaign_run(campaign_run_id)
+    return {"items": _list_tactics(campaign_run_id)}
+
+
+@app.post("/v1/campaign-runs/{campaign_run_id}/tactics/generate", dependencies=[Depends(auth)])
+def generate_tactics_for_campaign(campaign_run_id: str):
+    cr = get_campaign_run(campaign_run_id)
+
+    # Aggregate outcomes by template + segment
+    conn = db()
+    attempt_rows = conn.execute(
+        "select channel, template_id, outcome_code, count(1) as c from outreach_attempts where campaign_run_id=? group by channel, template_id, outcome_code",
+        (campaign_run_id,),
+    ).fetchall()
+
+    # BusinessProfile distribution
+    bp_rows = conn.execute(
+        "select bp.vertical_category as vc, count(1) as c from business_profiles bp join leads l on l.id=bp.lead_id where l.campaign_run_id=? group by bp.vertical_category order by c desc limit 20",
+        (campaign_run_id,),
+    ).fetchall()
+    conn.close()
+
+    attempts_summary = [dict(r) for r in attempt_rows]
+    bp_dist = [dict(r) for r in bp_rows]
+
+    payload = {
+        "campaign": {"id": campaign_run_id, "criteria": cr.get("criteria")},
+        "attempts_summary": attempts_summary,
+        "business_profile_distribution": bp_dist,
+    }
+
+    raw = _llm_generate_tactics(payload)
+    created: List[Dict[str, Any]] = []
+    for t in raw:
+        st = _sanitize_tactic_proposal(t)
+        if not st:
+            continue
+        created.append(_create_tactic(campaign_run_id, st, created_by="ai", status="proposed"))
+
+    emit_event(campaign_run_id, "campaign.tactics_generated", "Tactics generated", {"count": len(created)})
+    return {"items": created}
+
+
+@app.post("/v1/tactics/{tactic_id}/activate", dependencies=[Depends(auth)])
+def activate_tactic(tactic_id: str, allocation_pct: int = 10):
+    allocation_pct = max(1, min(int(allocation_pct or 10), 50))
+    conn = db()
+    t = conn.execute("select * from tactics where id=?", (tactic_id,)).fetchone()
+    if not t:
+        conn.close()
+        raise HTTPException(404, "Tactic not found")
+
+    campaign_run_id = t["campaign_run_id"]
+
+    # end any active experiment for campaign (one-at-a-time MVP)
+    conn.execute(
+        "update experiments set status='ended', ended_at=? where campaign_run_id=? and status='active'",
+        (now_iso(), campaign_run_id),
+    )
+
+    ex_id = f"ex_{uuid.uuid4().hex}"
+    conn.execute(
+        "insert into experiments (id,campaign_run_id,tactic_id,allocation_pct,started_at,ended_at,metrics_snapshot_json,status) values (?,?,?,?,?,?,?,?)",
+        (ex_id, campaign_run_id, tactic_id, allocation_pct, now_iso(), None, json.dumps({}), "active"),
+    )
+    conn.execute("update tactics set status='active', updated_at=? where id=?", (now_iso(), tactic_id))
+    conn.commit()
+    conn.close()
+
+    emit_event(campaign_run_id, "campaign.experiment_started", "Experiment started", {"experiment_id": ex_id, "tactic_id": tactic_id, "allocation_pct": allocation_pct})
+    return {"experiment_id": ex_id, "tactic_id": tactic_id, "allocation_pct": allocation_pct}
+
+
+@app.get("/v1/experiments", dependencies=[Depends(auth)])
+def list_experiments(campaign_run_id: str):
+    _ = get_campaign_run(campaign_run_id)
+    conn = db()
+    rows = conn.execute("select * from experiments where campaign_run_id=? order by started_at desc", (campaign_run_id,)).fetchall()
+    conn.close()
+    return {"items": [dict(r) for r in rows]}
+
+
+@app.post("/v1/experiments/{experiment_id}/end", dependencies=[Depends(auth)])
+def end_experiment(experiment_id: str):
+    conn = db()
+    row = conn.execute("select * from experiments where id=?", (experiment_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "Experiment not found")
+    campaign_run_id = row["campaign_run_id"]
+    conn.execute("update experiments set status='ended', ended_at=? where id=?", (now_iso(), experiment_id))
+    conn.commit()
+    conn.close()
+    emit_event(campaign_run_id, "campaign.experiment_ended", "Experiment ended", {"experiment_id": experiment_id})
+    return {"experiment_id": experiment_id, "status": "ended"}
+
+
 @app.get("/v1/tasks", dependencies=[Depends(auth)])
 def list_tasks(campaign_run_id: Optional[str] = None, status: Optional[str] = None, due_before: Optional[str] = None, limit: int = 200):
     statuses = [s.strip() for s in (status or "").split(",") if s.strip()]
@@ -2224,6 +2612,8 @@ def list_tasks(campaign_run_id: Optional[str] = None, status: Optional[str] = No
                 "window_end_est": r["window_end_est"],
                 "instructions": r["instructions"],
                 "template_id": r["template_id"],
+                "tactic_id": r["tactic_id"],
+                "experiment_id": r["experiment_id"],
                 "completion": json.loads(r["completion_json"] or "{}"),
             }
         )
@@ -2249,7 +2639,7 @@ def _log_outreach_attempt(body: OutreachAttemptCreate) -> Dict[str, Any]:
 
     oid = f"oa_{uuid.uuid4().hex}"
     conn.execute(
-        "insert into outreach_attempts (id,campaign_run_id,lead_id,channel,template_id,executed_at,outcome_code,outcome_notes,created_at) values (?,?,?,?,?,?,?,?,?)",
+        "insert into outreach_attempts (id,campaign_run_id,lead_id,channel,template_id,executed_at,outcome_code,outcome_notes,tactic_id,experiment_id,created_at) values (?,?,?,?,?,?,?,?,?,?,?)",
         (
             oid,
             body.campaign_run_id,
@@ -2259,6 +2649,8 @@ def _log_outreach_attempt(body: OutreachAttemptCreate) -> Dict[str, Any]:
             body.executed_at,
             body.outcome_code,
             body.outcome_notes,
+            body.tactic_id,
+            body.experiment_id,
             now_iso(),
         ),
     )
@@ -2288,6 +2680,8 @@ def _log_outreach_attempt(body: OutreachAttemptCreate) -> Dict[str, Any]:
             "template_id": body.template_id,
             "executed_at": body.executed_at,
             "outcome_code": body.outcome_code,
+            "tactic_id": body.tactic_id,
+            "experiment_id": body.experiment_id,
         },
         lead_id=body.lead_id,
     )
@@ -2301,6 +2695,8 @@ def _log_outreach_attempt(body: OutreachAttemptCreate) -> Dict[str, Any]:
         "executed_at": body.executed_at,
         "outcome_code": body.outcome_code,
         "outcome_notes": body.outcome_notes,
+        "tactic_id": body.tactic_id,
+        "experiment_id": body.experiment_id,
         "created_at": now_iso(),
     }
 
@@ -2446,6 +2842,25 @@ def metrics_overview(campaign_run_id: Optional[str] = None):
     for r in ch_rows:
         attempts_by_channel[r["channel"]] = r["c"]
 
+    # attempts by tactic (requires attribution on OutreachAttempts)
+    by_tactic: List[Dict[str, Any]] = []
+    if campaign_run_id:
+        tr = conn.execute(
+            "select tactic_id, count(*) as attempts from outreach_attempts where campaign_run_id=? and tactic_id is not null group by tactic_id order by attempts desc",
+            (campaign_run_id,),
+        ).fetchall()
+        for row in tr:
+            tactic_id = row["tactic_id"]
+            replies = conn.execute(
+                "select count(*) as c from outreach_attempts where campaign_run_id=? and tactic_id=? and outcome_code in (?,?,?,?)",
+                (campaign_run_id, tactic_id, "replied", "positive", "negative", "meeting_booked"),
+            ).fetchone()["c"]
+            meetings = conn.execute(
+                "select count(*) as c from outreach_attempts where campaign_run_id=? and tactic_id=? and outcome_code='meeting_booked'",
+                (campaign_run_id, tactic_id),
+            ).fetchone()["c"]
+            by_tactic.append({"tactic_id": tactic_id, "attempts": row["attempts"], "replies": replies, "meetings": meetings})
+
     reply_codes = ("replied", "positive", "negative", "meeting_booked")
     replies_total = conn.execute(
         f"select count(*) as c from outreach_attempts{where} and outcome_code in (?,?,?,?)" if where else "select count(*) as c from outreach_attempts where outcome_code in (?,?,?,?)",
@@ -2511,6 +2926,7 @@ def metrics_overview(campaign_run_id: Optional[str] = None):
         # execution/outcome fields
         "attempts_total": attempts_total,
         "attempts_by_channel": attempts_by_channel,
+        "attempts_by_tactic": by_tactic,
         "replies_total": replies_total,
         "positive_replies_total": positive_replies_total,
         "meetings_total": meetings_total,

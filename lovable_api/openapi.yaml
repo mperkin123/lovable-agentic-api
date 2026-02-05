@@ -125,6 +125,8 @@ components:
         window_end_est: { type: string, format: date-time, nullable: true }
         instructions: { type: string }
         template_id: { type: string, nullable: true }
+        tactic_id: { type: string, nullable: true }
+        experiment_id: { type: string, nullable: true }
         completion:
           type: object
           properties:
@@ -156,7 +158,38 @@ components:
         lead_id: { type: string }
         channel: { type: string, enum: [email, phone, linkedin, other] }
         template_id: { type: string, nullable: true }
+        tactic_id: { type: string, nullable: true }
+        experiment_id: { type: string, nullable: true }
         executed_at: { type: string, format: date-time }
+
+    Tactic:
+      type: object
+      properties:
+        id: { type: string }
+        campaign_run_id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        channels:
+          type: array
+          items: { type: string }
+        target_segment: { type: object }
+        hypothesis: { type: string }
+        pattern: { type: object }
+        created_by: { type: string, enum: [ai, human] }
+        status: { type: string, enum: [proposed, active, archived] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Experiment:
+      type: object
+      properties:
+        id: { type: string }
+        campaign_run_id: { type: string }
+        tactic_id: { type: string }
+        allocation_pct: { type: integer }
+        started_at: { type: string, format: date-time }
+        ended_at: { type: string, format: date-time, nullable: true }
+        status: { type: string, enum: [active, ended] }
         outcome_code:
           type: string
           enum: [sent, delivered, replied, positive, negative, meeting_booked, bounced, unsubscribed]
@@ -466,6 +499,109 @@ paths:
                   created: { type: integer }
                   skipped: { type: integer }
                   considered: { type: integer }
+  /v1/tactics:
+    get:
+      summary: List tactics
+      parameters:
+        - in: query
+          name: campaign_run_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Tactic' }
+
+  /v1/campaign-runs/{campaign_run_id}/tactics/generate:
+    post:
+      summary: Generate tactic proposals (AI)
+      parameters:
+        - in: path
+          name: campaign_run_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Tactic' }
+
+  /v1/tactics/{tactic_id}/activate:
+    post:
+      summary: Activate tactic (human)
+      parameters:
+        - in: path
+          name: tactic_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: allocation_pct
+          required: false
+          schema: { type: integer, default: 10, minimum: 1, maximum: 50 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  experiment_id: { type: string }
+                  tactic_id: { type: string }
+                  allocation_pct: { type: integer }
+
+  /v1/experiments:
+    get:
+      summary: List experiments
+      parameters:
+        - in: query
+          name: campaign_run_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Experiment' }
+
+  /v1/experiments/{experiment_id}/end:
+    post:
+      summary: End experiment
+      parameters:
+        - in: path
+          name: experiment_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  experiment_id: { type: string }
+                  status: { type: string }
+
   /v1/tasks:
     get:
       summary: List tasks

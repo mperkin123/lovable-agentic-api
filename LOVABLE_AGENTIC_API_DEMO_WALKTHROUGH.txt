@@ -207,49 +207,133 @@ Function: _website_fetch + _strip_html
 Demo framing:
 - “We can pull lightweight website signals without crawling. This is a POC, not a full crawler.”
 
-4.5 LLM extraction (planned)
-- In this POC, extractions are present as a field but are not truly LLM-driven.
-- Future: extract industry, services, credibility signals, etc.
+4.5 Prompt 1: AI business categorization & extraction (BusinessProfile)
+Objective
+- Convert noisy lead inputs (seed CSV + Google Places + website text) into a structured, explainable BusinessProfile used downstream.
 
-4.6 Scoring and tiering (deterministic stub)
-Function: _score_stub
-Priority order (matches our product intent):
-1) Location (0–50)
-2) Size (0–30) using Employees
-3) Industry (0–20) keyword match
+Where it runs in the pipeline
+- After enrichment (Places + website fetch), before scoring.
 
-Tier mapping:
-- A: total >= 80
-- B: total >= 65
-- C: total >= 50
-- D: else
+What gets persisted
+- Table: business_profiles (1:1 with lead via lead_id unique)
+- BusinessProfile fields (stored + attached into lead JSON as lead.business_profile):
+  - vertical_category (controlled list + "unknown")
+  - services: string[]
+  - customer_type: B2B | B2C | mixed | unknown
+  - buyer_persona_hint: string|null
+  - credibility_signals: string[]
+  - confidence: float 0–1
+  - evidence_used: string[] (google_places, website_page, seed_description)
+  - raw_llm_json (for debugging)
 
-Explainability
-- Each lead gets reasoning_bullets, and the list endpoint shows top_reasons.
+LLM prompt guardrails (important demo point)
+- Must only use facts present in evidence inputs.
+- If unsure, output "unknown" and reduce confidence.
+- Output must be strict JSON.
 
-4.7 Task generation
+Failure behavior (demo-safe)
+- If the LLM errors or OpenAI isn’t configured, the run continues:
+  - BusinessProfile defaults to unknown/low confidence
+  - Event emitted: lead.business_profile_error
+
+Events
+- lead.business_profile_extracted
+- lead.business_profile_error
+
+
+4.6 Prompt 2: AI scoring with explanations (hybrid, demo-safe)
+Objective
+- Produce an AI-assisted score + explanations while keeping deterministic rules scoring as stable fallback.
+
+How it works
+- We still compute rules_total using deterministic scoring (Location > Size > Industry).
+- Then (if OpenAI configured) we ask the LLM for ai_total + reasoning.
+- final_total is clamped to stay near rules_total (demo stability).
+
+Lead.score fields (stored in lead JSON)
+- rules_total (0–100)
+- ai_total (0–100)
+- final_total (0–100)  (back-compat: score.total == final_total)
+- tier (A/B/C/D derived from final_total)
+- ai_used (bool)
+- reasoning_bullets (max 4)
+- reasoning_citations (references to BusinessProfile/evidence fields used)
+
+Failure behavior
+- If AI scoring fails:
+  - ai_total = rules_total
+  - ai_used = false
+  - run continues
+
+Events
+- lead.ai_scored
+- lead.ai_scored_error
+
+
+4.7 Prompt 3: AI personalization & MessageDrafts
+Objective
+- Generate personalized outreach drafts per lead and persist them as first-class objects.
+
+Where it runs
+- After scoring.
+- Generates for Tier A/B leads (and also supports a fallback top-N path).
+
+What gets persisted
+- Table: message_drafts
+- Fields: id, campaign_run_id, lead_id, channel, template_id, subject, body, personalization_facts[], safety_checks_passed, created_at
+
+Guardrails
+- Must only use facts in BusinessProfile or enrichment evidence.
+- If not enough evidence, draft is generic with fewer specifics.
+- Draft failure does NOT fail the run.
+
+Events
+- lead.message_draft_created
+- lead.message_draft_error
+
+
+4.8 Task generation (and tactic attribution)
 Function: _generate_tasks_stub
-- For each eligible lead, creates tasks like:
-  - email_1 (template: E1_MANDATE_SALEONLY)
-  - call_1  (template: CALL_VERIFY)
+- For eligible leads, creates tasks like:
+  - email_1
+  - call_1
 
-Rules:
+Rules
 - By default, tasks are created for tier A/B.
 
 Fallback behavior (key demo feature)
 - If no A/B tasks are created, the POC creates tasks for top N leads anyway.
-- Controlled by env var:
-  TASK_TOP_N (default 25)
+- Controlled by env var: TASK_TOP_N (default 25)
 - The fallback emits events with payload.reason = "fallback_top_n".
+
+Tactics/experiments attribution (Prompt 4 MVP)
+- If there is an active experiment for the campaign:
+  - a deterministic subset of eligible leads gets the tactic variant
+  - tasks are tagged with tactic_id + experiment_id
 
 
 5) API surface (what Lovable should call)
 
 All endpoints require Authorization: Bearer <API_TOKEN>
 
+5.0 Health checks
+- GET /v1/health (NO AUTH)
+  Returns { ok:true, service, time }.
+  Use this for Render liveness / uptime probes.
+
+- GET /v1/health/openai (AUTH)
+  Returns whether OpenAI is configured.
+  - Optional: /v1/health/openai?probe=true to actually call the model (debug).
+
+
 5.1 Campaign runs
 - POST /v1/campaign-runs
   Creates a CampaignRun.
+
+- GET /v1/campaign-runs
+  Lists recent runs (Lovable index page).
+  Query params: limit, cursor, status
+  Returns {items, nextCursor}.
 
 - GET /v1/campaign-runs/{id}
   Returns run status + progress.
@@ -262,6 +346,10 @@ All endpoints require Authorization: Bearer <API_TOKEN>
   - 200 when started
   - 409 if already running
   - 409 if complete (unless force=true)
+
+Admin “unstick”
+- POST /v1/campaign-runs/{id}/abort
+  Sets status=aborted and the runner will exit on its next status check.
 
 5.2 Events (live progress)
 Default (recommended for demo): polling
@@ -277,12 +365,21 @@ Optional (do not depend on it for demo): SSE
 
 Event types you’ll see in practice:
 - progress (campaign created/imported/run started/progress reset/run complete)
+- campaign.aborted
 - lead.places_enriched
 - lead.website_enriched
-- lead.scored
+- lead.business_profile_extracted
+- lead.business_profile_error
+- lead.ai_scored
+- lead.ai_scored_error
+- lead.message_draft_created
+- lead.message_draft_error
 - lead.tasks_created
 - task.completed
 - attempt.logged (created when real-world outreach execution is logged)
+- campaign.tactics_generated
+- campaign.experiment_started
+- campaign.experiment_ended
 
 5.3 Leads
 - GET /v1/campaign-runs/{id}/leads
@@ -293,6 +390,17 @@ Event types you’ll see in practice:
 
 - GET /v1/leads/{leadId}
   Lead detail.
+  Includes:
+  - business_profile
+  - score fields (rules_total/ai_total/final_total/tier/etc.)
+  - message_drafts (generated drafts for this lead)
+
+MessageDrafts
+- GET /v1/message-drafts?campaign_run_id=...&lead_id=...&channel=email
+  Lists persisted drafts.
+
+Escape hatch (backfill drafts after-the-fact)
+- POST /v1/campaign-runs/{id}/generate-message-drafts?tier=A,B&limit=25
 
 5.4 Tasks
 - GET /v1/tasks
@@ -335,6 +443,8 @@ OutreachAttempt payload shape (example)
   "lead_id": "ld_xxx",
   "channel": "email",
   "template_id": "E1_MANDATE_SALEONLY",
+  "tactic_id": null,
+  "experiment_id": null,
   "executed_at": "2026-02-06T15:04:00Z",
   "outcome_code": "sent",
   "outcome_notes": "Initial outreach email sent"
@@ -372,6 +482,31 @@ OutreachAttempt payload shape (example)
   Notes:
   - Metrics are computed dynamically from OutreachAttempt rows (no cached rollups needed in this POC).
   - When showing rates, guard against attempts_total=0.
+  - Prompt 4 MVP adds basic attribution: attempts_by_tactic (if attempts were logged with tactic_id).
+
+5.7 Prompt 4: Tactics + Experiments (campaign intelligence loop)
+- POST /v1/campaign-runs/{id}/tactics/generate
+  Generates 3–5 AI-proposed tactics based on outcomes + lead distribution.
+  Stores as Tactic(status=proposed).
+
+- GET /v1/tactics?campaign_run_id=...
+  List proposed/active tactics.
+
+Human activation (required)
+- POST /v1/tactics/{tactic_id}/activate?allocation_pct=10
+  Starts an Experiment(status=active) and flips tactic to active.
+  (MVP constraint: one active experiment at a time per campaign.)
+
+- GET /v1/experiments?campaign_run_id=...
+  List experiments.
+
+- POST /v1/experiments/{experiment_id}/end
+  Ends an experiment.
+
+Allocator behavior (important demo point)
+- Only ACTIVE experiments apply.
+- A deterministic subset of eligible leads gets the tactic variant (so reruns are stable).
+- Tasks created under the experiment carry tactic_id + experiment_id.
 
 
 6) Lovable frontend: recommended screens/components
@@ -401,6 +536,7 @@ Columns:
 - business_name, city/state, employees
 - owner_email
 - score_total, tier
+- vertical_category, profile_confidence
 - top_reasons (3 bullets)
 - next_task (if any)
 Actions:
@@ -412,10 +548,17 @@ D) Tasks preview
 
 6.3 “Lead Detail” page
 Goal: explainability and enrichment evidence.
-- seed fields (what we imported)
-- evidence sources (Google/website)
-- score breakdown (components)
-- tasks for this lead
+Show these blocks:
+- Seed fields (what we imported)
+- Evidence sources (Google Places + website snippet)
+- BusinessProfile (Prompt 1)
+  - vertical_category, services, customer_type, credibility_signals, confidence
+- Score (Prompt 2)
+  - rules_total, ai_total, final_total, tier, ai_used
+  - reasoning_bullets + reasoning_citations
+- MessageDrafts (Prompt 3)
+  - show latest email draft body + personalization_facts
+- Tasks for this lead
 
 6.4 “Tasks Admin” page
 Goal: assign and track tasks (no rep assignment required yet).
