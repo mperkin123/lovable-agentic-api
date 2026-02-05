@@ -214,6 +214,10 @@ def create_campaign_run(body: CampaignRunCreate):
         "leads_scored": 0,
         "tasks_created": 0,
         "tasks_completed": 0,
+        # execution metrics (OutreachAttempts)
+        "attempts_total": 0,
+        "replies": 0,
+        "meetings": 0,
         "errors": 0,
     }
     conn = db()
@@ -1034,8 +1038,7 @@ def list_tasks(campaign_run_id: Optional[str] = None, status: Optional[str] = No
     return {"tasks": out}
 
 
-@app.post("/v1/outreach-attempts", dependencies=[Depends(auth)])
-def create_outreach_attempt(body: OutreachAttemptCreate):
+def _log_outreach_attempt(body: OutreachAttemptCreate) -> Dict[str, Any]:
     # basic validation
     allowed_channels = {"email", "phone", "linkedin", "other"}
     allowed_outcomes = {"sent", "delivered", "replied", "positive", "negative", "meeting_booked", "bounced", "unsubscribed"}
@@ -1045,7 +1048,7 @@ def create_outreach_attempt(body: OutreachAttemptCreate):
         raise HTTPException(400, f"Invalid outcome_code: {body.outcome_code}")
 
     # ensure campaign + lead exist
-    _ = get_campaign_run(body.campaign_run_id)
+    cr = get_campaign_run(body.campaign_run_id)
     conn = db()
     lead_row = conn.execute("select id from leads where id=? and campaign_run_id=?", (body.lead_id, body.campaign_run_id)).fetchone()
     if not lead_row:
@@ -1069,6 +1072,15 @@ def create_outreach_attempt(body: OutreachAttemptCreate):
     )
     conn.commit()
     conn.close()
+
+    # Update campaign progress counters (if present)
+    prog = cr.get("progress") or {}
+    prog["attempts_total"] = int(prog.get("attempts_total") or 0) + 1
+    if body.outcome_code in {"replied", "positive", "negative", "meeting_booked"}:
+        prog["replies"] = int(prog.get("replies") or 0) + 1
+    if body.outcome_code == "meeting_booked":
+        prog["meetings"] = int(prog.get("meetings") or 0) + 1
+    update_campaign_run(body.campaign_run_id, progress=prog)
 
     emit_event(
         body.campaign_run_id,
@@ -1094,7 +1106,20 @@ def create_outreach_attempt(body: OutreachAttemptCreate):
         "executed_at": body.executed_at,
         "outcome_code": body.outcome_code,
         "outcome_notes": body.outcome_notes,
+        "created_at": now_iso(),
     }
+
+
+@app.post("/v1/outreach-attempts", dependencies=[Depends(auth)])
+def create_outreach_attempt(body: OutreachAttemptCreate):
+    # Back-compat endpoint (200)
+    return _log_outreach_attempt(body)
+
+
+@app.post("/v1/attempts", status_code=201, dependencies=[Depends(auth)])
+def create_attempt(body: OutreachAttemptCreate):
+    # Primary endpoint requested for execution logging (201)
+    return _log_outreach_attempt(body)
 
 
 @app.get("/v1/outreach-attempts", dependencies=[Depends(auth)])
