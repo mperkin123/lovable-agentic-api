@@ -123,6 +123,28 @@ components:
         outcome_notes: { type: string, nullable: true }
         created_at: { type: string, format: date-time }
 paths:
+  /v1/health/openai:
+    get:
+      summary: OpenAI integration health
+      parameters:
+        - in: query
+          name: probe
+          required: false
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configured: { type: boolean }
+                  model: { type: string }
+                  ok: { type: boolean, nullable: true }
+                  status_code: { type: integer, nullable: true }
+                  latency_ms: { type: integer, nullable: true }
+                  error: { nullable: true }
   /v1/campaign-runs:
     get:
       summary: List campaign runs

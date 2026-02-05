@@ -238,6 +238,55 @@ def _startup():
     init_db()
 
 
+@app.get("/v1/health/openai", dependencies=[Depends(auth)])
+def health_openai(probe: bool = False):
+    """OpenAI integration health.
+
+    - configured: whether OPENAI_API_KEY is set
+    - probe=true: makes a tiny real call to verify credentials + network
+    """
+    out: Dict[str, Any] = {
+        "configured": bool(OPENAI_API_KEY),
+        "model": OPENAI_MODEL,
+    }
+    if not probe:
+        return out
+
+    if not OPENAI_API_KEY:
+        return {**out, "ok": False, "error": "OPENAI_API_KEY not set"}
+
+    t0 = time.time()
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": OPENAI_MODEL,
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": "Return valid JSON only."},
+                    {"role": "user", "content": "{\"ping\":true}"},
+                ],
+                "response_format": {"type": "json_object"},
+                "max_tokens": 30,
+            },
+            timeout=20,
+        )
+        ok = r.status_code == 200
+        # do not return full response (could include provider metadata); just summary
+        err = None
+        if not ok:
+            try:
+                err = (r.json() or {}).get("error")
+            except Exception:
+                err = r.text[:500]
+        dt = int((time.time() - t0) * 1000)
+        return {**out, "ok": ok, "status_code": r.status_code, "latency_ms": dt, "error": err}
+    except Exception as e:
+        dt = int((time.time() - t0) * 1000)
+        return {**out, "ok": False, "status_code": None, "latency_ms": dt, "error": f"{type(e).__name__}: {str(e)[:300]}"}
+
+
 @app.post("/v1/campaign-runs", dependencies=[Depends(auth)])
 def create_campaign_run(body: CampaignRunCreate):
     cid = f"cr_{uuid.uuid4().hex}"
