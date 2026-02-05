@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -22,6 +23,11 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 API_TOKEN = os.environ.get("API_TOKEN", "dev-token")
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+
+# Lovable-friendly CORS:
+# - Set CORS_ALLOW_ORIGINS="https://your-lovable-app.com,https://another-origin.com"
+# - For demo convenience, default is "*".
+CORS_ALLOW_ORIGINS = os.environ.get("CORS_ALLOW_ORIGINS", "*")
 
 DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(__file__), "poc.db")
 
@@ -195,6 +201,19 @@ class OutreachAttemptCreate(BaseModel):
 
 
 app = FastAPI(title="Lovable Agentic API (POC)")
+
+_allow_origins = [o.strip() for o in (CORS_ALLOW_ORIGINS or "").split(",") if o.strip()]
+if not _allow_origins:
+    _allow_origins = ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allow_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["Authorization", "Content-Type"],
+    expose_headers=["Content-Type"],
+)
 
 
 @app.on_event("startup")

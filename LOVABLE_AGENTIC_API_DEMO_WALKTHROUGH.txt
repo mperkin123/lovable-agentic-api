@@ -31,6 +31,12 @@ Authentication
 - All endpoints (except SSE auth is handled manually) require:
   Authorization: Bearer <API_TOKEN>
 
+CORS (Lovable-friendly)
+- The API enables CORS via env var CORS_ALLOW_ORIGINS.
+- Set it on Render to your Lovable app origin(s), e.g.:
+  CORS_ALLOW_ORIGINS=https://your-lovable-app.com
+- For demo convenience, server defaults to allowing all origins ("*") unless overridden.
+
 Note on intermittent 502s
 - Render edge can sometimes show HTML “502 Bad Gateway” during deploys/cold starts.
 - If you get 502, retry after ~30–60s. If you get JSON (401/200), the app is reachable.
@@ -258,12 +264,16 @@ All endpoints require Authorization: Bearer <API_TOKEN>
   - 409 if complete (unless force=true)
 
 5.2 Events (live progress)
-Two options:
-- GET /v1/campaign-runs/{id}/events
-  Polling. Returns {events[], nextCursor}
+Default (recommended for demo): polling
+- GET /v1/campaign-runs/{id} every ~2s (status + progress)
+- GET /v1/campaign-runs/{id}/events?cursor=... every ~2s
+  Returns {events[], nextCursor}
 
+Optional (do not depend on it for demo): SSE
 - GET /v1/campaign-runs/{id}/events/stream
   SSE stream for near-real-time UI.
+  Notes:
+  - SSE + Authorization headers + CORS varies by host; keep this as an enhancement.
 
 Event types you’ll see in practice:
 - progress (campaign created/imported/run started/progress reset/run complete)
