@@ -154,6 +154,19 @@ def init_db():
           created_at text,
           updated_at text
         );
+
+        create table if not exists message_drafts (
+          id text primary key,
+          campaign_run_id text,
+          lead_id text,
+          channel text,
+          template_id text,
+          subject text,
+          body text,
+          personalization_facts_json text,
+          safety_checks_passed integer,
+          created_at text
+        );
         """
     )
     conn.commit()
@@ -1077,6 +1090,110 @@ def _llm_ai_score_lead(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _llm_message_draft(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate a personalized message draft.
+
+    Returns strict JSON with:
+      subject, body, personalization_facts, safety_checks_passed
+
+    Caller is responsible for fallback + persistence.
+    """
+    if not OPENAI_API_KEY:
+        return {"ok": False, "error": "OPENAI_API_KEY not set", "raw_llm_json": None}
+
+    system = (
+        "You write outreach drafts grounded ONLY in the provided evidence. "
+        "Do not invent facts. If evidence is thin, keep it generic. "
+        "Return STRICT JSON only (no markdown)."
+    )
+
+    user = {
+        "task": "Generate MessageDraft",
+        "channel": payload.get("channel"),
+        "template_id": payload.get("template_id"),
+        "requirements": {
+            "subject": "string (email only)",
+            "body": "string",
+            "personalization_facts": "string[] (facts actually used)",
+            "safety_checks_passed": "boolean (true only if all facts are supported by payload evidence)",
+        },
+        "allowed_fact_sources": [
+            "business_profile",
+            "seed.business_name",
+            "seed.city",
+            "seed.state",
+            "places.formatted_address",
+            "places.rating",
+            "places.reviews",
+            "places.website",
+            "website_sample",
+        ],
+        "payload": payload,
+    }
+
+    last_err: Optional[str] = None
+    try:
+        for attempt in range(OPENAI_MAX_RETRIES):
+            _openai_throttle()
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": OPENAI_MODEL,
+                    "temperature": 0.4,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": json.dumps(user)},
+                    ],
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=60,
+            )
+
+            if r.status_code == 429:
+                sleep_s = min(8.0, 0.75 * (2**attempt))
+                last_err = f"429 rate_limited (attempt {attempt+1}/{OPENAI_MAX_RETRIES})"
+                time.sleep(sleep_s)
+                continue
+
+            if r.status_code >= 400:
+                try:
+                    last_err = json.dumps((r.json() or {}).get("error") or {})[:800]
+                except Exception:
+                    last_err = (r.text or "")[:800]
+                break
+
+            data = r.json()
+            content = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+            parsed = _extract_json_object(content) or {}
+
+            subject = str(parsed.get("subject") or "").strip()
+            body = str(parsed.get("body") or "").strip()
+            facts = parsed.get("personalization_facts") or []
+            if not isinstance(facts, list):
+                facts = []
+            facts = [str(x).strip() for x in facts if str(x).strip()][:20]
+            safety = bool(parsed.get("safety_checks_passed"))
+
+            if not body:
+                last_err = "empty_body"
+                break
+
+            return {
+                "ok": True,
+                "subject": subject,
+                "body": body,
+                "personalization_facts": facts,
+                "safety_checks_passed": safety,
+                "raw_llm_json": content[:50_000],
+            }
+
+    except Exception as e:
+        last_err = f"{type(e).__name__}: {str(e)[:300]}"
+
+    return {"ok": False, "error": last_err or "openai_failed", "raw_llm_json": f"error: {last_err or 'openai_failed'}"}
+
+
 def _tier_from_total(total: int) -> str:
     if total >= 80:
         return "A"
@@ -1163,6 +1280,76 @@ def _generate_tasks_stub(campaign_run_id: str, lead_id: str, lead: Dict[str, Any
             "template_id": "CALL_VERIFY",
         },
     ]
+
+
+def _message_drafts_for_lead(lead_id: str) -> List[Dict[str, Any]]:
+    conn = db()
+    rows = conn.execute(
+        "select * from message_drafts where lead_id=? order by created_at asc",
+        (lead_id,),
+    ).fetchall()
+    conn.close()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "id": r["id"],
+                "campaign_run_id": r["campaign_run_id"],
+                "lead_id": r["lead_id"],
+                "channel": r["channel"],
+                "template_id": r["template_id"],
+                "subject": r["subject"],
+                "body": r["body"],
+                "personalization_facts": json.loads(r["personalization_facts_json"] or "[]"),
+                "safety_checks_passed": bool(r["safety_checks_passed"]),
+                "created_at": r["created_at"],
+            }
+        )
+    return out
+
+
+def _create_message_draft(
+    *,
+    campaign_run_id: str,
+    lead_id: str,
+    channel: str,
+    template_id: str,
+    subject: str,
+    body: str,
+    personalization_facts: List[str],
+    safety_checks_passed: bool,
+) -> Dict[str, Any]:
+    md_id = f"md_{uuid.uuid4().hex}"
+    conn = db()
+    conn.execute(
+        "insert into message_drafts (id,campaign_run_id,lead_id,channel,template_id,subject,body,personalization_facts_json,safety_checks_passed,created_at) values (?,?,?,?,?,?,?,?,?,?)",
+        (
+            md_id,
+            campaign_run_id,
+            lead_id,
+            channel,
+            template_id,
+            subject,
+            body,
+            json.dumps(personalization_facts or []),
+            1 if safety_checks_passed else 0,
+            now_iso(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "id": md_id,
+        "campaign_run_id": campaign_run_id,
+        "lead_id": lead_id,
+        "channel": channel,
+        "template_id": template_id,
+        "subject": subject,
+        "body": body,
+        "personalization_facts": personalization_facts or [],
+        "safety_checks_passed": bool(safety_checks_passed),
+        "created_at": now_iso(),
+    }
 
 
 def _runner(campaign_run_id: str):
@@ -1431,8 +1618,72 @@ def _runner(campaign_run_id: str):
             update_campaign_run(campaign_run_id, progress=prog)
             continue
 
-        # Tasks for A/B
+        # MessageDrafts + Tasks for A/B
         if tier in ("A", "B"):
+            # Generate at least 1 email draft (idempotent-ish)
+            try:
+                conn = db()
+                md_existing = conn.execute(
+                    "select count(1) as c from message_drafts where campaign_run_id=? and lead_id=? and channel='email'",
+                    (campaign_run_id, lead_id),
+                ).fetchone()["c"]
+                conn.close()
+
+                if not md_existing or int(md_existing) == 0:
+                    seed = lead.get("seed", {})
+                    md_payload = {
+                        "channel": "email",
+                        "template_id": "E1_MANDATE_SALEONLY",
+                        "criteria": criteria,
+                        "business_profile": lead.get("business_profile") or {},
+                        "seed": {
+                            "business_name": seed.get("business_name"),
+                            "city": seed.get("city"),
+                            "state": seed.get("state"),
+                            "employees": seed.get("employees"),
+                            "business_description": (seed.get("business_description") or "")[:2000],
+                            "website": seed.get("website"),
+                        },
+                        "places": (lead.get("business") or {}).get("google") or {},
+                        "website_sample": ((text[:2500] if text else "") or ""),
+                    }
+
+                    md = _llm_message_draft(md_payload)
+                    if md.get("ok"):
+                        saved = _create_message_draft(
+                            campaign_run_id=campaign_run_id,
+                            lead_id=lead_id,
+                            channel="email",
+                            template_id="E1_MANDATE_SALEONLY",
+                            subject=str(md.get("subject") or "").strip(),
+                            body=str(md.get("body") or "").strip(),
+                            personalization_facts=[str(x) for x in (md.get("personalization_facts") or [])],
+                            safety_checks_passed=bool(md.get("safety_checks_passed")),
+                        )
+                        emit_event(
+                            campaign_run_id,
+                            "lead.message_draft_created",
+                            "Message draft created",
+                            {"draft_id": saved.get("id"), "channel": "email", "template_id": "E1_MANDATE_SALEONLY", "safety_checks_passed": saved.get("safety_checks_passed")},
+                            lead_id=lead_id,
+                        )
+                    else:
+                        emit_event(
+                            campaign_run_id,
+                            "lead.message_draft_error",
+                            "Message draft failed (skipped)",
+                            {"error": (md.get("error") or md.get("raw_llm_json") or "")[:200]},
+                            lead_id=lead_id,
+                        )
+            except Exception as e:
+                emit_event(
+                    campaign_run_id,
+                    "lead.message_draft_error",
+                    "Message draft error (skipped)",
+                    {"error": f"{type(e).__name__}: {str(e)[:200]}"},
+                    lead_id=lead_id,
+                )
+
             # Avoid duplicating tasks on force reruns
             conn = db()
             existing = conn.execute(
@@ -1507,6 +1758,55 @@ def _runner(campaign_run_id: str):
 
             lead_id = r["id"]
             lead = json.loads(r["lead_json"])
+
+            # Generate at least 1 email draft for fallback top N (idempotent-ish)
+            try:
+                conn = db()
+                md_existing = conn.execute(
+                    "select count(1) as c from message_drafts where campaign_run_id=? and lead_id=? and channel='email'",
+                    (campaign_run_id, lead_id),
+                ).fetchone()["c"]
+                conn.close()
+
+                if not md_existing or int(md_existing) == 0:
+                    seed = lead.get("seed", {})
+                    md_payload = {
+                        "channel": "email",
+                        "template_id": "E1_MANDATE_SALEONLY",
+                        "criteria": criteria,
+                        "business_profile": lead.get("business_profile") or {},
+                        "seed": {
+                            "business_name": seed.get("business_name"),
+                            "city": seed.get("city"),
+                            "state": seed.get("state"),
+                            "employees": seed.get("employees"),
+                            "business_description": (seed.get("business_description") or "")[:2000],
+                            "website": seed.get("website"),
+                        },
+                        "places": (lead.get("business") or {}).get("google") or {},
+                        "website_sample": "",
+                    }
+                    md = _llm_message_draft(md_payload)
+                    if md.get("ok"):
+                        saved = _create_message_draft(
+                            campaign_run_id=campaign_run_id,
+                            lead_id=lead_id,
+                            channel="email",
+                            template_id="E1_MANDATE_SALEONLY",
+                            subject=str(md.get("subject") or "").strip(),
+                            body=str(md.get("body") or "").strip(),
+                            personalization_facts=[str(x) for x in (md.get("personalization_facts") or [])],
+                            safety_checks_passed=bool(md.get("safety_checks_passed")),
+                        )
+                        emit_event(
+                            campaign_run_id,
+                            "lead.message_draft_created",
+                            "Message draft created",
+                            {"draft_id": saved.get("id"), "channel": "email", "template_id": "E1_MANDATE_SALEONLY", "reason": "fallback_top_n", "safety_checks_passed": saved.get("safety_checks_passed")},
+                            lead_id=lead_id,
+                        )
+            except Exception:
+                pass
 
             # skip if tasks already exist
             conn = db()
@@ -1740,7 +2040,46 @@ def lead_detail(lead_id: str):
     conn.close()
     if not row:
         raise HTTPException(404, "Lead not found")
-    return json.loads(row["lead_json"])
+    lead = json.loads(row["lead_json"])
+    lead["message_drafts"] = _message_drafts_for_lead(lead_id)
+    return lead
+
+
+@app.get("/v1/message-drafts", dependencies=[Depends(auth)])
+def list_message_drafts(campaign_run_id: str, lead_id: Optional[str] = None, channel: Optional[str] = None, limit: int = 200):
+    limit = max(1, min(int(limit or 200), 500))
+    conn = db()
+    sql = "select * from message_drafts where campaign_run_id=?"
+    params: List[Any] = [campaign_run_id]
+    if lead_id:
+        sql += " and lead_id=?"
+        params.append(lead_id)
+    if channel:
+        sql += " and channel=?"
+        params.append(channel)
+    sql += " order by created_at asc limit ?"
+    params.append(limit)
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    conn.close()
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        items.append(
+            {
+                "id": r["id"],
+                "campaign_run_id": r["campaign_run_id"],
+                "lead_id": r["lead_id"],
+                "channel": r["channel"],
+                "template_id": r["template_id"],
+                "subject": r["subject"],
+                "body": r["body"],
+                "personalization_facts": json.loads(r["personalization_facts_json"] or "[]"),
+                "safety_checks_passed": bool(r["safety_checks_passed"]),
+                "created_at": r["created_at"],
+            }
+        )
+
+    return {"items": items}
 
 
 @app.get("/v1/tasks", dependencies=[Depends(auth)])
