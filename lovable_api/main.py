@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -1276,7 +1276,33 @@ def metrics_overview(campaign_run_id: Optional[str] = None):
         tuple(params) if where else (),
     ).fetchone()["c"]
 
+    unsubscribes_total = conn.execute(
+        f"select count(*) as c from outreach_attempts{where} and outcome_code='unsubscribed'" if where else "select count(*) as c from outreach_attempts where outcome_code='unsubscribed'",
+        tuple(params) if where else (),
+    ).fetchone()["c"]
+
     bounce_rate = (bounces_total / attempts_total) if attempts_total else 0.0
+    reply_rate = (replies_total / attempts_total) if attempts_total else 0.0
+    meeting_rate = (meetings_total / attempts_total) if attempts_total else 0.0
+
+    # last 7d metrics (based on executed_at)
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat().replace("+00:00", "Z")
+
+    # attempts_last_7d
+    attempts_last_7d = conn.execute(
+        (f"select count(*) as c from outreach_attempts{where} and executed_at >= ?" if where else "select count(*) as c from outreach_attempts where executed_at >= ?"),
+        tuple(params + [cutoff_iso]) if where else (cutoff_iso,),
+    ).fetchone()["c"]
+
+    replies_last_7d = conn.execute(
+        (f"select count(*) as c from outreach_attempts{where} and executed_at >= ? and outcome_code in (?,?,?,?)" if where else "select count(*) as c from outreach_attempts where executed_at >= ? and outcome_code in (?,?,?,?)"),
+        tuple(params + [cutoff_iso] + list(reply_codes)) if where else tuple([cutoff_iso] + list(reply_codes)),
+    ).fetchone()["c"]
+
+    meetings_last_7d = conn.execute(
+        (f"select count(*) as c from outreach_attempts{where} and executed_at >= ? and outcome_code='meeting_booked'" if where else "select count(*) as c from outreach_attempts where executed_at >= ? and outcome_code='meeting_booked'"),
+        tuple(params + [cutoff_iso]) if where else (cutoff_iso,),
+    ).fetchone()["c"]
 
     conn.close()
 
@@ -1287,11 +1313,20 @@ def metrics_overview(campaign_run_id: Optional[str] = None):
         "tasks_total": total_tasks,
         "tasks_done": done_tasks,
         "task_completion_rate": (done_tasks / total_tasks) if total_tasks else 0.0,
-        # new execution fields
+        # execution/outcome fields
         "attempts_total": attempts_total,
         "attempts_by_channel": attempts_by_channel,
         "replies_total": replies_total,
         "positive_replies_total": positive_replies_total,
         "meetings_total": meetings_total,
+        "bounces_total": bounces_total,
+        "unsubscribes_total": unsubscribes_total,
         "bounce_rate": bounce_rate,
+        "reply_rate": reply_rate,
+        "meeting_rate": meeting_rate,
+        # last 7d
+        "attempts_last_7d": attempts_last_7d,
+        "replies_last_7d": replies_last_7d,
+        "meetings_last_7d": meetings_last_7d,
+        "last_7d_cutoff_utc": cutoff_iso,
     }
