@@ -95,6 +95,27 @@ def init_db():
           message text,
           payload_json text
         );
+
+        create table if not exists places_cache (
+          cache_key text primary key,
+          name text,
+          city text,
+          state text,
+          website_hint text,
+          status text,
+          place_id text,
+          maps_url text,
+          rating real,
+          reviews integer,
+          types_json text,
+          phone text,
+          website text,
+          formatted_address text,
+          lat real,
+          lng real,
+          raw_json text,
+          fetched_at text
+        );
         """
     )
     conn.commit()
@@ -267,16 +288,125 @@ def import_seed_csv(campaign_run_id: str, file: UploadFile = File(...)):
     return {"imported": imported}
 
 
-def _places_lookup(name: str, city: str, state: str) -> Dict[str, Any]:
+def _norm(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+
+def _places_cache_key(name: str, city: str, state: str, website_hint: str = "") -> str:
+    # Keep key stable and short. Website hint is optional.
+    base = f"{_norm(name)}|{_norm(city)}|{_norm(state)}"
+    wh = _norm(website_hint)
+    if wh:
+        return f"{base}|{wh}"
+    return base
+
+
+def _places_cache_get(cache_key: str, ttl_days: int = 30) -> Optional[Dict[str, Any]]:
+    conn = db()
+    row = conn.execute("select * from places_cache where cache_key=?", (cache_key,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+
+    fetched_at = row["fetched_at"]
+    if fetched_at:
+        try:
+            dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+            if age_days > ttl_days:
+                return None
+        except Exception:
+            # if parsing fails, treat as stale
+            return None
+
+    if row["status"] != "hit":
+        return None
+
+    return {
+        "place_id": row["place_id"],
+        "url": row["maps_url"],
+        "rating": row["rating"],
+        "user_ratings_total": row["reviews"],
+        "types": json.loads(row["types_json"] or "[]"),
+        "formatted_phone_number": row["phone"],
+        "website": row["website"],
+        "formatted_address": row["formatted_address"],
+        "geometry": {"location": {"lat": row["lat"], "lng": row["lng"]}},
+    }
+
+
+def _places_cache_put(cache_key: str, *, name: str, city: str, state: str, website_hint: str, status: str, payload: Dict[str, Any]):
+    conn = db()
+    types_json = json.dumps(payload.get("types") or [])
+    geom = ((payload.get("geometry") or {}).get("location") or {})
+    lat = geom.get("lat")
+    lng = geom.get("lng")
+    conn.execute(
+        """
+        insert into places_cache (cache_key,name,city,state,website_hint,status,place_id,maps_url,rating,reviews,types_json,phone,website,formatted_address,lat,lng,raw_json,fetched_at)
+        values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        on conflict(cache_key) do update set
+          status=excluded.status,
+          place_id=excluded.place_id,
+          maps_url=excluded.maps_url,
+          rating=excluded.rating,
+          reviews=excluded.reviews,
+          types_json=excluded.types_json,
+          phone=excluded.phone,
+          website=excluded.website,
+          formatted_address=excluded.formatted_address,
+          lat=excluded.lat,
+          lng=excluded.lng,
+          raw_json=excluded.raw_json,
+          fetched_at=excluded.fetched_at
+        """,
+        (
+            cache_key,
+            name,
+            city,
+            state,
+            website_hint,
+            status,
+            payload.get("place_id"),
+            payload.get("url"),
+            payload.get("rating"),
+            payload.get("user_ratings_total"),
+            types_json,
+            payload.get("formatted_phone_number"),
+            payload.get("website"),
+            payload.get("formatted_address"),
+            lat,
+            lng,
+            json.dumps(payload)[:200_000],
+            now_iso(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _places_lookup(name: str, city: str, state: str, website_hint: str = "") -> Dict[str, Any]:
+    # Return shape similar to Google Places Details result.
     if not GOOGLE_MAPS_API_KEY:
         return {}
+
+    cache_key = _places_cache_key(name, city, state, website_hint)
+    cached = _places_cache_get(cache_key)
+    if cached:
+        return cached
+
     s = requests.Session()
-    q = f"{name} {city} {state}"
+    q = f"{name} {city} {state}".strip()
+
+    # 1) text search
     ts_url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
     ts = s.get(ts_url, params={"query": q, "key": GOOGLE_MAPS_API_KEY}, timeout=20).json()
     pid = ((ts.get("results") or [{}])[0]).get("place_id")
     if not pid:
+        _places_cache_put(cache_key, name=name, city=city, state=state, website_hint=website_hint, status="miss", payload={"place_id": None})
         return {}
+
+    # 2) details
     det_url = "https://maps.googleapis.com/maps/api/place/details/json"
     fields = [
         "name",
@@ -288,6 +418,7 @@ def _places_lookup(name: str, city: str, state: str) -> Dict[str, Any]:
         "rating",
         "user_ratings_total",
         "opening_hours",
+        "geometry",
     ]
     det = s.get(
         det_url,
@@ -296,7 +427,23 @@ def _places_lookup(name: str, city: str, state: str) -> Dict[str, Any]:
     ).json()
     res = det.get("result") or {}
     res["place_id"] = pid
-    return res
+
+    # normalize to a small payload we care about, but keep compatibility keys
+    out = {
+        "place_id": pid,
+        "url": res.get("url"),
+        "rating": res.get("rating"),
+        "user_ratings_total": res.get("user_ratings_total"),
+        "types": res.get("types") or [],
+        "formatted_phone_number": res.get("formatted_phone_number"),
+        "website": res.get("website"),
+        "formatted_address": res.get("formatted_address"),
+        "opening_hours": res.get("opening_hours") or {},
+        "geometry": res.get("geometry") or {},
+    }
+
+    _places_cache_put(cache_key, name=name, city=city, state=state, website_hint=website_hint, status="hit", payload={**out, "place_id": pid})
+    return out
 
 
 def _website_fetch(url: str) -> str:
@@ -401,7 +548,23 @@ def _runner(campaign_run_id: str):
     criteria = cr["criteria"]
 
     update_campaign_run(campaign_run_id, status="running")
-    emit_event(campaign_run_id, "progress", "Run started", {"status": "running"})
+    emit_event(
+        campaign_run_id,
+        "progress",
+        "Run started",
+        {
+            "status": "running",
+            "places_enabled": bool(GOOGLE_MAPS_API_KEY),
+            "places_cache_ttl_days": 30,
+        },
+    )
+    if not GOOGLE_MAPS_API_KEY:
+        emit_event(
+            campaign_run_id,
+            "progress",
+            "Google Places disabled (missing GOOGLE_MAPS_API_KEY)",
+            {"places_enabled": False},
+        )
 
     conn = db()
     leads = conn.execute("select id, lead_json from leads where campaign_run_id=?", (campaign_run_id,)).fetchall()
@@ -429,7 +592,12 @@ def _runner(campaign_run_id: str):
 
         # Places enrich
         seed = lead.get("seed", {})
-        places = _places_lookup(seed.get("business_name", ""), seed.get("city", ""), seed.get("state", ""))
+        places = _places_lookup(
+            seed.get("business_name", ""),
+            seed.get("city", ""),
+            seed.get("state", ""),
+            website_hint=seed.get("website", ""),
+        )
         if places:
             lead["business"].setdefault("google", {})
             lead["business"]["google"] = {
@@ -438,8 +606,11 @@ def _runner(campaign_run_id: str):
                 "rating": places.get("rating"),
                 "reviews": places.get("user_ratings_total"),
                 "types": places.get("types"),
-                "hours_local": (places.get("opening_hours") or {}).get("weekday_text"),
+                "phone": places.get("formatted_phone_number"),
                 "website": places.get("website"),
+                "formatted_address": places.get("formatted_address"),
+                "latlng": ((places.get("geometry") or {}).get("location") or {}),
+                "hours_local": (places.get("opening_hours") or {}).get("weekday_text"),
             }
             lead["evidence"]["sources"].append(
                 {
@@ -451,6 +622,7 @@ def _runner(campaign_run_id: str):
                         "formatted_phone_number": places.get("formatted_phone_number"),
                         "rating": places.get("rating"),
                         "user_ratings_total": places.get("user_ratings_total"),
+                        "website": places.get("website"),
                     },
                 }
             )
