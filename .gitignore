@@ -1,0 +1,33 @@
+.env
+*.db
+*.sqlite
+*.sqlite3
+output/
+.trash/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# venv
+.venv/
+venv/
+
+# local notes / memory
+memory/
+MEMORY.md
+USER.md
+SOUL.md
+TOOLS.md
+IDENTITY.md
+HEARTBEAT.md
+AGENTS.md
+
+# data files
+*.csv
+curl
