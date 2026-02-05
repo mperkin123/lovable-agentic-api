@@ -945,6 +945,148 @@ def upsert_business_profile(lead_id: str, bp: Dict[str, Any]) -> Dict[str, Any]:
     return bp_out
 
 
+def _llm_ai_score_lead(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """AI-assisted scoring.
+
+    Returns:
+      { ai_used, ai_total, reasoning_bullets, reasoning_citations }
+
+    Demo-safe constraints:
+    - Strict JSON only
+    - Reasons must cite only provided payload fields
+    - On failure, caller should fall back to rules_total
+    """
+    if not OPENAI_API_KEY:
+        return {
+            "ai_used": False,
+            "ai_total": None,
+            "reasoning_bullets": [],
+            "reasoning_citations": [],
+            "raw_llm_json": None,
+        }
+
+    system = (
+        "You are scoring a business lead for outreach response likelihood. "
+        "Use ONLY the provided evidence payload. Do NOT guess. "
+        "Return STRICT JSON only (no markdown, no commentary). "
+        "Reasoning bullets must be short (max 4) and must be grounded in cited fields."
+    )
+
+    user = {
+        "task": "AI score lead (0-100) + grounded reasons",
+        "rules": {
+            "ai_total": "integer 0..100",
+            "reasoning_bullets": "string[] max 4",
+            "reasoning_citations": "array of {field: string, value: any} referencing ONLY allowed fields",
+        },
+        "allowed_field_prefixes": [
+            "criteria.",
+            "rules_score.",
+            "business_profile.",
+            "seed.",
+            "places.",
+            "website_sample.",
+        ],
+        "payload": payload,
+    }
+
+    last_err: Optional[str] = None
+    try:
+        for attempt in range(OPENAI_MAX_RETRIES):
+            _openai_throttle()
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": OPENAI_MODEL,
+                    "temperature": 0.2,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": json.dumps(user)},
+                    ],
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=45,
+            )
+
+            if r.status_code == 429:
+                sleep_s = min(8.0, 0.75 * (2**attempt))
+                last_err = f"429 rate_limited (attempt {attempt+1}/{OPENAI_MAX_RETRIES})"
+                time.sleep(sleep_s)
+                continue
+
+            if r.status_code >= 400:
+                try:
+                    last_err = json.dumps((r.json() or {}).get("error") or {})[:800]
+                except Exception:
+                    last_err = (r.text or "")[:800]
+                break
+
+            data = r.json()
+            content = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+            parsed = _extract_json_object(content) or {}
+
+            ai_total = parsed.get("ai_total")
+            try:
+                ai_total_i = int(float(ai_total))
+            except Exception:
+                ai_total_i = None
+
+            bullets = parsed.get("reasoning_bullets") or []
+            if not isinstance(bullets, list):
+                bullets = []
+            bullets = [str(b).strip() for b in bullets if str(b).strip()][:4]
+
+            cits = parsed.get("reasoning_citations") or []
+            if not isinstance(cits, list):
+                cits = []
+            norm_cits: List[Dict[str, Any]] = []
+            for c in cits[:20]:
+                if not isinstance(c, dict):
+                    continue
+                field = str(c.get("field") or "").strip()
+                if not field:
+                    continue
+                if not any(field.startswith(p) for p in ["criteria.", "rules_score.", "business_profile.", "seed.", "places.", "website_sample."]):
+                    continue
+                norm_cits.append({"field": field, "value": c.get("value")})
+
+            if ai_total_i is None:
+                # treat as invalid
+                last_err = "invalid_ai_total"
+                break
+
+            ai_total_i = max(0, min(100, ai_total_i))
+            return {
+                "ai_used": True,
+                "ai_total": ai_total_i,
+                "reasoning_bullets": bullets,
+                "reasoning_citations": norm_cits,
+                "raw_llm_json": content[:50_000],
+            }
+
+    except Exception as e:
+        last_err = f"{type(e).__name__}: {str(e)[:300]}"
+
+    return {
+        "ai_used": False,
+        "ai_total": None,
+        "reasoning_bullets": [],
+        "reasoning_citations": [],
+        "raw_llm_json": f"error: {last_err or 'openai_failed'}",
+    }
+
+
+def _tier_from_total(total: int) -> str:
+    if total >= 80:
+        return "A"
+    if total >= 65:
+        return "B"
+    if total >= 50:
+        return "C"
+    return "D"
+
+
 def _score_stub(lead: Dict[str, Any], criteria: Dict[str, Any]) -> Tuple[int, str, List[str], Dict[str, Any]]:
     """Deterministic stub: location>size>industry. Replace with real scorer later."""
     seed = lead.get("seed", {})
@@ -980,8 +1122,8 @@ def _score_stub(lead: Dict[str, Any], criteria: Dict[str, Any]) -> Tuple[int, st
         else:
             industry_points = 8
 
-    total = min(100, loc_points + size_points + industry_points)
-    tier = "A" if total >= 80 else "B" if total >= 65 else "C" if total >= 50 else "D"
+    rules_total = min(100, loc_points + size_points + industry_points)
+    tier = _tier_from_total(rules_total)
     reasons = [
         f"Location points={loc_points} (seed {city},{state}).",
         f"Size points={size_points} (Employees={emp}).",
@@ -992,7 +1134,7 @@ def _score_stub(lead: Dict[str, Any], criteria: Dict[str, Any]) -> Tuple[int, st
         "size_fit": {"points": size_points, "max": 30, "why": "Employees vs target band"},
         "industry_fit": {"points": industry_points, "max": 20, "why": "Seed description vs preferences"},
     }
-    return total, tier, reasons, components
+    return rules_total, tier, reasons, components
 
 
 def _generate_tasks_stub(campaign_run_id: str, lead_id: str, lead: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1194,11 +1336,77 @@ def _runner(campaign_run_id: str):
                     lead_id=lead_id,
                 )
 
-            # Score
-            total, tier, reasons, components = _score_stub(lead, criteria)
-            lead["score"] = {"total": total, "tier": tier, "components": components, "reasoning_bullets": reasons}
+            # Score (rules + AI hybrid)
+            rules_total, _rules_tier, rules_reasons, components = _score_stub(lead, criteria)
+
+            # Build evidence payload for AI scoring (grounded)
+            seed = lead.get("seed", {})
+            ai_payload = {
+                "criteria": criteria,
+                "rules_score": {"rules_total": rules_total, "components": components},
+                "business_profile": lead.get("business_profile") or {},
+                "seed": {
+                    "business_name": seed.get("business_name"),
+                    "city": seed.get("city"),
+                    "state": seed.get("state"),
+                    "employees": seed.get("employees"),
+                    "business_description": (seed.get("business_description") or "")[:2000],
+                    "website": seed.get("website"),
+                },
+                "places": (lead.get("business") or {}).get("google") or {},
+                "website_sample": ((text[:2500] if text else "") or ""),
+            }
+
+            ai = _llm_ai_score_lead(ai_payload)
+            ai_used = bool(ai.get("ai_used"))
+            ai_total = ai.get("ai_total")
+
+            if ai_used and isinstance(ai_total, int):
+                # Clamp to keep demo stable and prevent hallucinated swings
+                final_total = int(max(rules_total - 25, min(rules_total + 25, ai_total)))
+                final_tier = _tier_from_total(final_total)
+                reasoning_bullets = (ai.get("reasoning_bullets") or [])[:4]
+                reasoning_citations = ai.get("reasoning_citations") or []
+                emit_event(
+                    campaign_run_id,
+                    "lead.ai_scored",
+                    "AI score computed",
+                    {"ai_total": ai_total, "final_total": final_total, "ai_used": True},
+                    lead_id=lead_id,
+                )
+            else:
+                final_total = int(rules_total)
+                final_tier = _tier_from_total(final_total)
+                ai_total = int(rules_total)
+                reasoning_bullets = rules_reasons[:4]
+                reasoning_citations = []
+                emit_event(
+                    campaign_run_id,
+                    "lead.ai_scored_error",
+                    "AI scoring failed; defaulted to rules score",
+                    {"ai_used": False, "error": (ai.get("raw_llm_json") or "")[:200]},
+                    lead_id=lead_id,
+                )
+
+            # Back-compat: score.total is the sortable total. We'll store FINAL there.
+            lead["score"] = {
+                "total": final_total,
+                "rules_total": rules_total,
+                "ai_total": ai_total,
+                "final_total": final_total,
+                "tier": final_tier,
+                "ai_used": bool(ai_used),
+                "components": components,
+                "reasoning_bullets": reasoning_bullets,
+                "reasoning_citations": reasoning_citations,
+            }
+
             prog["leads_scored"] = min(prog["leads_scored"] + 1, prog.get("seed_rows_total") or prog["leads_scored"] + 1)
-            emit_event(campaign_run_id, "lead.scored", "Lead scored", {"total": total, "tier": tier}, lead_id=lead_id)
+            emit_event(campaign_run_id, "lead.scored", "Lead scored", {"rules_total": rules_total, "final_total": final_total, "tier": final_tier}, lead_id=lead_id)
+
+            # for downstream
+            total = final_total
+            tier = final_tier
 
             # Persist lead (even if later stages fail)
             conn = db()

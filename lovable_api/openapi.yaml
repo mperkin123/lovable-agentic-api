@@ -82,11 +82,32 @@ components:
         owner: { type: object }
         evidence: { type: object }
         extractions: { type: object }
-        score: { type: object }
+        score:
+          type: object
+          properties:
+            total: { type: integer, description: 'Back-compat: equals final_total' }
+            rules_total: { type: integer }
+            ai_total: { type: integer }
+            final_total: { type: integer }
+            tier: { type: string }
+            ai_used: { type: boolean }
+            reasoning_bullets:
+              type: array
+              items: { type: string }
+            reasoning_citations:
+              type: array
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  value: { }
         campaign_plan: { type: object }
         task_ids:
           type: array
           items: { type: string }
+        business_profile:
+          type: object
+          nullable: true
     Task:
       type: object
       properties:
