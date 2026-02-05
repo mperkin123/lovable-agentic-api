@@ -268,7 +268,7 @@ def health_openai(probe: bool = False):
                     {"role": "user", "content": "{\"ping\":true}"},
                 ],
                 "response_format": {"type": "json_object"},
-                "max_tokens": 30,
+                "max_completion_tokens": 30,
             },
             timeout=20,
         )
