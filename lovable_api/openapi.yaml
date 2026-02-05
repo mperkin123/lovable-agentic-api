@@ -1,0 +1,333 @@
+openapi: 3.0.3
+info:
+  title: Lovable Agentic API (POC)
+  version: 0.1.0
+servers:
+  - url: http://localhost:8000
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    CampaignRun:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        status: { type: string, enum: [draft, running, paused, complete, failed] }
+        criteria:
+          type: object
+          properties:
+            industry_preferences_text: { type: string }
+            exclusions_text: { type: string }
+            locations_text: { type: string }
+            size_text: { type: string }
+        progress:
+          type: object
+          properties:
+            seed_rows_total: { type: integer }
+            leads_created: { type: integer }
+            leads_enriched_places: { type: integer }
+            leads_enriched_website: { type: integer }
+            leads_scored: { type: integer }
+            tasks_created: { type: integer }
+            tasks_completed: { type: integer }
+            errors: { type: integer }
+    Event:
+      type: object
+      properties:
+        id: { type: string }
+        campaign_run_id: { type: string }
+        time: { type: string, format: date-time }
+        type: { type: string }
+        lead_id: { type: string, nullable: true }
+        message: { type: string }
+        payload: { type: object }
+    LeadRow:
+      type: object
+      properties:
+        id: { type: string }
+        owner_name: { type: string }
+        owner_email: { type: string }
+        business_name: { type: string }
+        city: { type: string }
+        state: { type: string }
+        employees: { type: integer }
+        score_total: { type: integer }
+        tier: { type: string }
+        top_reasons:
+          type: array
+          items: { type: string }
+        next_task:
+          type: object
+          nullable: true
+          properties:
+            task_id: { type: string }
+            type: { type: string }
+            due_at_est: { type: string, format: date-time }
+    LeadDetail:
+      type: object
+      properties:
+        id: { type: string }
+        campaign_run_id: { type: string }
+        seed: { type: object }
+        business: { type: object }
+        owner: { type: object }
+        evidence: { type: object }
+        extractions: { type: object }
+        score: { type: object }
+        campaign_plan: { type: object }
+        task_ids:
+          type: array
+          items: { type: string }
+    Task:
+      type: object
+      properties:
+        id: { type: string }
+        campaign_run_id: { type: string }
+        lead_id: { type: string }
+        type: { type: string }
+        channel: { type: string }
+        status: { type: string }
+        due_at_est: { type: string, format: date-time }
+        window_start_est: { type: string, format: date-time, nullable: true }
+        window_end_est: { type: string, format: date-time, nullable: true }
+        instructions: { type: string }
+        template_id: { type: string, nullable: true }
+        completion:
+          type: object
+          properties:
+            completed_at: { type: string, format: date-time, nullable: true }
+            outcome_code: { type: string, nullable: true }
+            outcome_notes: { type: string, nullable: true }
+paths:
+  /v1/campaign-runs:
+    post:
+      summary: Create campaign run
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                criteria: { $ref: '#/components/schemas/CampaignRun/properties/criteria' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignRun' }
+  /v1/campaign-runs/{id}:
+    get:
+      summary: Get campaign run
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignRun' }
+  /v1/campaign-runs/{id}/import/seed-csv:
+    post:
+      summary: Import seed CSV
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imported: { type: integer }
+  /v1/campaign-runs/{id}/run:
+    post:
+      summary: Start pipeline
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignRun' }
+  /v1/campaign-runs/{id}/events:
+    get:
+      summary: Poll events
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: cursor
+          required: false
+          schema: { type: string }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, default: 200 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: '#/components/schemas/Event' }
+                  nextCursor: { type: string, nullable: true }
+  /v1/campaign-runs/{id}/leads:
+    get:
+      summary: List leads
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: tier
+          required: false
+          schema: { type: string, description: 'Comma-separated list' }
+        - in: query
+          name: sort
+          required: false
+          schema: { type: string, enum: [score_desc, score_asc], default: score_desc }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, default: 50 }
+        - in: query
+          name: cursor
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  leads:
+                    type: array
+                    items: { $ref: '#/components/schemas/LeadRow' }
+                  nextCursor: { type: string, nullable: true }
+  /v1/leads/{leadId}:
+    get:
+      summary: Lead detail
+      parameters:
+        - in: path
+          name: leadId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeadDetail' }
+  /v1/tasks:
+    get:
+      summary: List tasks
+      parameters:
+        - in: query
+          name: campaign_run_id
+          required: false
+          schema: { type: string }
+        - in: query
+          name: status
+          required: false
+          schema: { type: string, description: 'Comma-separated statuses' }
+        - in: query
+          name: due_before
+          required: false
+          schema: { type: string, format: date-time }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, default: 200 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks:
+                    type: array
+                    items: { $ref: '#/components/schemas/Task' }
+  /v1/tasks/{taskId}:
+    patch:
+      summary: Update task
+      parameters:
+        - in: path
+          name: taskId
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+  /v1/metrics/overview:
+    get:
+      summary: Overview metrics
+      parameters:
+        - in: query
+          name: campaign_run_id
+          required: false
+          schema: { type: string }
+        - in: query
+          name: from
+          required: false
+          schema: { type: string, format: date-time }
+        - in: query
+          name: to
+          required: false
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
