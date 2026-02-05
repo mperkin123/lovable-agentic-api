@@ -1,0 +1,15 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install deps
+COPY lovable_api/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copy app code
+COPY lovable_api /app/lovable_api
+
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+
+CMD ["bash", "-lc", "uvicorn lovable_api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
