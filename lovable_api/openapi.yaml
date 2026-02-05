@@ -105,6 +105,21 @@ components:
             completed_at: { type: string, format: date-time, nullable: true }
             outcome_code: { type: string, nullable: true }
             outcome_notes: { type: string, nullable: true }
+
+    OutreachAttempt:
+      type: object
+      properties:
+        id: { type: string }
+        campaign_run_id: { type: string }
+        lead_id: { type: string }
+        channel: { type: string, enum: [email, phone, linkedin, other] }
+        template_id: { type: string, nullable: true }
+        executed_at: { type: string, format: date-time }
+        outcome_code:
+          type: string
+          enum: [sent, delivered, replied, positive, negative, meeting_booked, bounced, unsubscribed]
+        outcome_notes: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
 paths:
   /v1/campaign-runs:
     post:
@@ -308,6 +323,58 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Task' }
+  /v1/outreach-attempts:
+    post:
+      summary: Log outreach attempt
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                campaign_run_id: { type: string }
+                lead_id: { type: string }
+                channel: { type: string, enum: [email, phone, linkedin, other] }
+                template_id: { type: string, nullable: true }
+                executed_at: { type: string, format: date-time }
+                outcome_code:
+                  type: string
+                  enum: [sent, delivered, replied, positive, negative, meeting_booked, bounced, unsubscribed]
+                outcome_notes: { type: string, nullable: true }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OutreachAttempt' }
+    get:
+      summary: List outreach attempts
+      parameters:
+        - in: query
+          name: campaign_run_id
+          required: false
+          schema: { type: string }
+        - in: query
+          name: lead_id
+          required: false
+          schema: { type: string }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, default: 200 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  outreach_attempts:
+                    type: array
+                    items: { $ref: '#/components/schemas/OutreachAttempt' }
+
   /v1/metrics/overview:
     get:
       summary: Overview metrics
