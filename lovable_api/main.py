@@ -1308,6 +1308,21 @@ def _message_drafts_for_lead(lead_id: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _extract_website_sample_from_lead(lead: Dict[str, Any], max_len: int = 2500) -> str:
+    try:
+        sources = ((lead.get("evidence") or {}).get("sources") or [])
+        for s in sources:
+            if (s or {}).get("source_type") == "website_page":
+                snippets = (s or {}).get("snippets") or []
+                if snippets and isinstance(snippets, list):
+                    q = (snippets[0] or {}).get("quote")
+                    if q:
+                        return str(q)[:max_len]
+        return ""
+    except Exception:
+        return ""
+
+
 def _create_message_draft(
     *,
     campaign_run_id: str,
@@ -2080,6 +2095,98 @@ def list_message_drafts(campaign_run_id: str, lead_id: Optional[str] = None, cha
         )
 
     return {"items": items}
+
+
+@app.post("/v1/campaign-runs/{campaign_run_id}/generate-message-drafts", dependencies=[Depends(auth)])
+def generate_message_drafts(campaign_run_id: str, tier: str = "A,B", limit: int = 25):
+    """Generate MessageDrafts after-the-fact (escape hatch).
+
+    Useful if a run completed before drafts existed, or if drafts were disabled.
+    Generates 1 email draft per matching lead if missing.
+    """
+    tiers = [t.strip() for t in (tier or "").split(",") if t.strip()]
+    limit = max(1, min(int(limit or 25), 200))
+
+    # ensure run exists
+    _ = get_campaign_run(campaign_run_id)
+
+    conn = db()
+    sql = "select id, lead_json from leads where campaign_run_id=?"
+    params: List[Any] = [campaign_run_id]
+    if tiers:
+        sql += " and tier in (%s)" % ",".join(["?"] * len(tiers))
+        params.extend(tiers)
+    sql += " order by coalesce(score_total, -1) desc, id asc limit ?"
+    params.append(limit)
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    conn.close()
+
+    created = 0
+    skipped = 0
+    for r in rows:
+        lead_id = r["id"]
+        lead = json.loads(r["lead_json"])
+
+        conn = db()
+        md_existing = conn.execute(
+            "select count(1) as c from message_drafts where campaign_run_id=? and lead_id=? and channel='email'",
+            (campaign_run_id, lead_id),
+        ).fetchone()["c"]
+        conn.close()
+        if md_existing and int(md_existing) > 0:
+            skipped += 1
+            continue
+
+        seed = lead.get("seed", {})
+        website_sample = _extract_website_sample_from_lead(lead)
+        md_payload = {
+            "channel": "email",
+            "template_id": "E1_MANDATE_SALEONLY",
+            "criteria": (get_campaign_run(campaign_run_id).get("criteria") or {}),
+            "business_profile": lead.get("business_profile") or {},
+            "seed": {
+                "business_name": seed.get("business_name"),
+                "city": seed.get("city"),
+                "state": seed.get("state"),
+                "employees": seed.get("employees"),
+                "business_description": (seed.get("business_description") or "")[:2000],
+                "website": seed.get("website"),
+            },
+            "places": (lead.get("business") or {}).get("google") or {},
+            "website_sample": website_sample,
+        }
+
+        md = _llm_message_draft(md_payload)
+        if not md.get("ok"):
+            emit_event(
+                campaign_run_id,
+                "lead.message_draft_error",
+                "Message draft failed (skipped)",
+                {"error": (md.get("error") or md.get("raw_llm_json") or "")[:200]},
+                lead_id=lead_id,
+            )
+            continue
+
+        saved = _create_message_draft(
+            campaign_run_id=campaign_run_id,
+            lead_id=lead_id,
+            channel="email",
+            template_id="E1_MANDATE_SALEONLY",
+            subject=str(md.get("subject") or "").strip(),
+            body=str(md.get("body") or "").strip(),
+            personalization_facts=[str(x) for x in (md.get("personalization_facts") or [])],
+            safety_checks_passed=bool(md.get("safety_checks_passed")),
+        )
+        created += 1
+        emit_event(
+            campaign_run_id,
+            "lead.message_draft_created",
+            "Message draft created",
+            {"draft_id": saved.get("id"), "channel": "email", "template_id": "E1_MANDATE_SALEONLY", "reason": "manual_generate", "safety_checks_passed": saved.get("safety_checks_passed")},
+            lead_id=lead_id,
+        )
+
+    return {"campaign_run_id": campaign_run_id, "created": created, "skipped": skipped, "considered": len(rows)}
 
 
 @app.get("/v1/tasks", dependencies=[Depends(auth)])

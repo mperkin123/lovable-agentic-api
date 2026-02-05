@@ -436,6 +436,36 @@ paths:
                   items:
                     type: array
                     items: { $ref: '#/components/schemas/MessageDraft' }
+
+  /v1/campaign-runs/{campaign_run_id}/generate-message-drafts:
+    post:
+      summary: Generate message drafts (manual)
+      description: Generate 1 email MessageDraft per lead if missing.
+      parameters:
+        - in: path
+          name: campaign_run_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: tier
+          required: false
+          schema: { type: string, default: 'A,B' }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, default: 25 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  campaign_run_id: { type: string }
+                  created: { type: integer }
+                  skipped: { type: integer }
+                  considered: { type: integer }
   /v1/tasks:
     get:
       summary: List tasks
