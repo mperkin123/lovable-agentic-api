@@ -619,10 +619,18 @@ def _places_lookup(name: str, city: str, state: str, website_hint: str = "") -> 
 
 
 def _website_fetch(url: str) -> str:
+    # Keep this aggressive: website fetch is the #1 source of demo hangs.
     try:
-        r = requests.get(url, timeout=12, headers={"User-Agent": "LovableAgenticPOC/1.0"})
+        if not url or not url.startswith(("http://", "https://")):
+            return ""
+        r = requests.get(
+            url,
+            timeout=(5, 7),  # connect, read
+            headers={"User-Agent": "LovableAgenticPOC/1.0"},
+            allow_redirects=True,
+        )
         r.raise_for_status()
-        return r.text[:200_000]
+        return (r.text or "")[:200_000]
     except Exception:
         return ""
 
@@ -951,134 +959,153 @@ def _runner(campaign_run_id: str):
         lead_id = row["id"]
         lead = json.loads(row["lead_json"])
 
-        # Places enrich
-        seed = lead.get("seed", {})
-        places = _places_lookup(
-            seed.get("business_name", ""),
-            seed.get("city", ""),
-            seed.get("state", ""),
-            website_hint=seed.get("website", ""),
-        )
-        if places:
-            lead["business"].setdefault("google", {})
-            lead["business"]["google"] = {
-                "place_id": places.get("place_id"),
-                "maps_url": places.get("url"),
-                "rating": places.get("rating"),
-                "reviews": places.get("user_ratings_total"),
-                "types": places.get("types"),
-                "phone": places.get("formatted_phone_number"),
-                "website": places.get("website"),
-                "formatted_address": places.get("formatted_address"),
-                "latlng": ((places.get("geometry") or {}).get("location") or {}),
-                "hours_local": (places.get("opening_hours") or {}).get("weekday_text"),
-            }
-            lead["evidence"]["sources"].append(
-                {
-                    "source_type": "google_places",
-                    "url": places.get("url"),
-                    "captured_at": now_iso(),
-                    "fields": {
-                        "formatted_address": places.get("formatted_address"),
-                        "formatted_phone_number": places.get("formatted_phone_number"),
-                        "rating": places.get("rating"),
-                        "user_ratings_total": places.get("user_ratings_total"),
-                        "website": places.get("website"),
-                    },
-                }
+        try:
+            # Places enrich
+            seed = lead.get("seed", {})
+            places = _places_lookup(
+                seed.get("business_name", ""),
+                seed.get("city", ""),
+                seed.get("state", ""),
+                website_hint=seed.get("website", ""),
             )
-            prog["leads_enriched_places"] = min(prog["leads_enriched_places"] + 1, prog.get("seed_rows_total") or prog["leads_enriched_places"] + 1)
-            emit_event(
-                campaign_run_id,
-                "lead.places_enriched",
-                "Places enriched",
-                {
+            if places:
+                lead["business"].setdefault("google", {})
+                lead["business"]["google"] = {
+                    "place_id": places.get("place_id"),
+                    "maps_url": places.get("url"),
                     "rating": places.get("rating"),
                     "reviews": places.get("user_ratings_total"),
-                    "maps_url": places.get("url"),
-                },
-                lead_id=lead_id,
-            )
-
-        # Website enrich (POC: fetch homepage only)
-        html = _website_fetch(lead.get("seed", {}).get("website") or "")
-        text = _strip_html(html)
-        if text:
-            lead["evidence"]["sources"].append(
-                {
-                    "source_type": "website_page",
-                    "url": lead.get("seed", {}).get("website"),
-                    "captured_at": now_iso(),
-                    "snippets": [{"quote": text[:300], "label": "homepage_text_sample"}],
+                    "types": places.get("types"),
+                    "phone": places.get("formatted_phone_number"),
+                    "website": places.get("website"),
+                    "formatted_address": places.get("formatted_address"),
+                    "latlng": ((places.get("geometry") or {}).get("location") or {}),
+                    "hours_local": (places.get("opening_hours") or {}).get("weekday_text"),
                 }
-            )
-            prog["leads_enriched_website"] = min(prog["leads_enriched_website"] + 1, prog.get("seed_rows_total") or prog["leads_enriched_website"] + 1)
-            emit_event(
-                campaign_run_id,
-                "lead.website_enriched",
-                "Website enriched",
-                {"sample_len": len(text)},
-                lead_id=lead_id,
-            )
+                lead["evidence"]["sources"].append(
+                    {
+                        "source_type": "google_places",
+                        "url": places.get("url"),
+                        "captured_at": now_iso(),
+                        "fields": {
+                            "formatted_address": places.get("formatted_address"),
+                            "formatted_phone_number": places.get("formatted_phone_number"),
+                            "rating": places.get("rating"),
+                            "user_ratings_total": places.get("user_ratings_total"),
+                            "website": places.get("website"),
+                        },
+                    }
+                )
+                prog["leads_enriched_places"] = min(
+                    prog["leads_enriched_places"] + 1,
+                    prog.get("seed_rows_total") or prog["leads_enriched_places"] + 1,
+                )
+                emit_event(
+                    campaign_run_id,
+                    "lead.places_enriched",
+                    "Places enriched",
+                    {"rating": places.get("rating"), "reviews": places.get("user_ratings_total"), "maps_url": places.get("url")},
+                    lead_id=lead_id,
+                )
 
-        # Extract BusinessProfile (AI) after enrichment
-        try:
-            # Build evidence payload from what we have
-            evidence_used: List[str] = []
-            seed_desc = (seed.get("business_description") or "").strip()
-            if seed_desc:
-                evidence_used.append("seed_description")
-            if places:
-                evidence_used.append("google_places")
+            # Website enrich (POC: fetch homepage only)
+            html = _website_fetch(lead.get("seed", {}).get("website") or "")
+            text = _strip_html(html)
             if text:
-                evidence_used.append("website_page")
+                lead["evidence"]["sources"].append(
+                    {
+                        "source_type": "website_page",
+                        "url": lead.get("seed", {}).get("website"),
+                        "captured_at": now_iso(),
+                        "snippets": [{"quote": text[:300], "label": "homepage_text_sample"}],
+                    }
+                )
+                prog["leads_enriched_website"] = min(
+                    prog["leads_enriched_website"] + 1,
+                    prog.get("seed_rows_total") or prog["leads_enriched_website"] + 1,
+                )
+                emit_event(
+                    campaign_run_id,
+                    "lead.website_enriched",
+                    "Website enriched",
+                    {"sample_len": len(text)},
+                    lead_id=lead_id,
+                )
 
-            evidence_payload = {
-                "evidence_used": evidence_used,
-                "seed": {
-                    "business_name": seed.get("business_name"),
-                    "city": seed.get("city"),
-                    "state": seed.get("state"),
-                    "business_description": seed_desc[:2000],
-                },
-                "google_places": (lead.get("business") or {}).get("google"),
-                "website_sample": (text[:2500] if text else ""),
-            }
+            # Extract BusinessProfile (AI) after enrichment
+            try:
+                evidence_used: List[str] = []
+                seed_desc = (seed.get("business_description") or "").strip()
+                if seed_desc:
+                    evidence_used.append("seed_description")
+                if places:
+                    evidence_used.append("google_places")
+                if text:
+                    evidence_used.append("website_page")
 
-            bp_core = _llm_business_profile(evidence_payload)
-            bp_saved = upsert_business_profile(lead_id, bp_core)
-            lead["business_profile"] = bp_saved
+                evidence_payload = {
+                    "evidence_used": evidence_used,
+                    "seed": {
+                        "business_name": seed.get("business_name"),
+                        "city": seed.get("city"),
+                        "state": seed.get("state"),
+                        "business_description": seed_desc[:2000],
+                    },
+                    "google_places": (lead.get("business") or {}).get("google"),
+                    "website_sample": (text[:2500] if text else ""),
+                }
 
-            emit_event(
-                campaign_run_id,
-                "lead.business_profile_extracted",
-                "BusinessProfile extracted",
-                {"vertical_category": bp_saved.get("vertical_category"), "confidence": bp_saved.get("confidence")},
-                lead_id=lead_id,
+                bp_core = _llm_business_profile(evidence_payload)
+                bp_saved = upsert_business_profile(lead_id, bp_core)
+                lead["business_profile"] = bp_saved
+
+                emit_event(
+                    campaign_run_id,
+                    "lead.business_profile_extracted",
+                    "BusinessProfile extracted",
+                    {"vertical_category": bp_saved.get("vertical_category"), "confidence": bp_saved.get("confidence")},
+                    lead_id=lead_id,
+                )
+            except Exception as e:
+                prog["errors"] = int(prog.get("errors") or 0) + 1
+                bp_saved = upsert_business_profile(lead_id, _bp_default([]))
+                lead["business_profile"] = bp_saved
+                emit_event(
+                    campaign_run_id,
+                    "lead.business_profile_error",
+                    "BusinessProfile extraction error; defaulted",
+                    {"error": f"{type(e).__name__}: {str(e)[:200]}"},
+                    lead_id=lead_id,
+                )
+
+            # Score
+            total, tier, reasons, components = _score_stub(lead, criteria)
+            lead["score"] = {"total": total, "tier": tier, "components": components, "reasoning_bullets": reasons}
+            prog["leads_scored"] = min(prog["leads_scored"] + 1, prog.get("seed_rows_total") or prog["leads_scored"] + 1)
+            emit_event(campaign_run_id, "lead.scored", "Lead scored", {"total": total, "tier": tier}, lead_id=lead_id)
+
+            # Persist lead (even if later stages fail)
+            conn = db()
+            conn.execute(
+                "update leads set lead_json=?, score_total=?, tier=?, updated_at=? where id=?",
+                (json.dumps(lead), total, tier, now_iso(), lead_id),
             )
+            conn.commit()
+            conn.close()
+
+            update_campaign_run(campaign_run_id, progress=prog)
+
         except Exception as e:
-            # Do not fail pipeline
             prog["errors"] = int(prog.get("errors") or 0) + 1
-            bp_saved = upsert_business_profile(lead_id, _bp_default([]))
-            lead["business_profile"] = bp_saved
             emit_event(
                 campaign_run_id,
-                "lead.business_profile_error",
-                "BusinessProfile extraction error; defaulted",
-                {"error": f"{type(e).__name__}: {str(e)[:200]}"},
+                "lead.error",
+                "Lead processing error (skipped)",
+                {"error": f"{type(e).__name__}: {str(e)[:300]}"},
                 lead_id=lead_id,
             )
-
-        # Score
-        total, tier, reasons, components = _score_stub(lead, criteria)
-        lead["score"] = {
-            "total": total,
-            "tier": tier,
-            "components": components,
-            "reasoning_bullets": reasons,
-        }
-        prog["leads_scored"] = min(prog["leads_scored"] + 1, prog.get("seed_rows_total") or prog["leads_scored"] + 1)
-        emit_event(campaign_run_id, "lead.scored", "Lead scored", {"total": total, "tier": tier}, lead_id=lead_id)
+            update_campaign_run(campaign_run_id, progress=prog)
+            continue
 
         # Tasks for A/B
         if tier in ("A", "B"):
