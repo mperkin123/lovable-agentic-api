@@ -10,7 +10,7 @@ services:
       - key: DB_PATH
         value: /var/data/poc.db
       - key: GOOGLE_MAPS_API_KEY
-        sync: false
+        value: ""
     disk:
       name: lovable-api-disk
       mountPath: /var/data
