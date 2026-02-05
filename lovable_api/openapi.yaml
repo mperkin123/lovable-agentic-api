@@ -325,7 +325,7 @@ paths:
               schema: { $ref: '#/components/schemas/Task' }
   /v1/outreach-attempts:
     post:
-      summary: Log outreach attempt
+      summary: Log outreach attempt (back-compat)
       requestBody:
         required: true
         content:
@@ -374,6 +374,32 @@ paths:
                   outreach_attempts:
                     type: array
                     items: { $ref: '#/components/schemas/OutreachAttempt' }
+
+  /v1/attempts:
+    post:
+      summary: Log execution attempt
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                campaign_run_id: { type: string }
+                lead_id: { type: string }
+                channel: { type: string, enum: [email, phone, linkedin, other] }
+                template_id: { type: string, nullable: true }
+                executed_at: { type: string, format: date-time }
+                outcome_code:
+                  type: string
+                  enum: [sent, delivered, replied, positive, negative, meeting_booked, bounced, unsubscribed]
+                outcome_notes: { type: string, nullable: true }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OutreachAttempt' }
 
   /v1/metrics/overview:
     get:
