@@ -1304,6 +1304,9 @@ def metrics_overview(campaign_run_id: Optional[str] = None):
         tuple(params + [cutoff_iso]) if where else (cutoff_iso,),
     ).fetchone()["c"]
 
+    reply_rate_last_7d = (replies_last_7d / attempts_last_7d) if attempts_last_7d else 0.0
+    meeting_rate_last_7d = (meetings_last_7d / attempts_last_7d) if attempts_last_7d else 0.0
+
     conn.close()
 
     return {
@@ -1328,5 +1331,7 @@ def metrics_overview(campaign_run_id: Optional[str] = None):
         "attempts_last_7d": attempts_last_7d,
         "replies_last_7d": replies_last_7d,
         "meetings_last_7d": meetings_last_7d,
+        "reply_rate_last_7d": reply_rate_last_7d,
+        "meeting_rate_last_7d": meeting_rate_last_7d,
         "last_7d_cutoff_utc": cutoff_iso,
     }
