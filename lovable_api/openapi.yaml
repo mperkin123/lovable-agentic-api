@@ -123,6 +123,22 @@ components:
         outcome_notes: { type: string, nullable: true }
         created_at: { type: string, format: date-time }
 paths:
+  /v1/health:
+    get:
+      summary: Basic health check
+      description: Unauthenticated service liveness probe.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  service: { type: string }
+                  time: { type: string, format: date-time }
+
   /v1/health/openai:
     get:
       summary: OpenAI integration health

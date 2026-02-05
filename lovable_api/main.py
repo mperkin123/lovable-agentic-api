@@ -249,6 +249,15 @@ def _startup():
     init_db()
 
 
+@app.get("/v1/health")
+def health_root():
+    return {
+        "ok": True,
+        "service": "Lovable Agentic API (POC)",
+        "time": now_iso(),
+    }
+
+
 @app.get("/v1/health/openai", dependencies=[Depends(auth)])
 def health_openai(probe: bool = False):
     """OpenAI integration health.
