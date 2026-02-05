@@ -45,8 +45,26 @@ Key fields:
 - name: display name
 - status: draft | running | paused | complete | failed
 - criteria: freeform campaign criteria (strings)
-- progress: counters (seed_rows_total, leads_created, leads_scored, tasks_created, …)
+- progress: rollup counters for planning + execution
 - created_at / updated_at
+
+Progress counters (current)
+Planning (pipeline):
+- seed_rows_total
+- leads_created
+- leads_enriched_places
+- leads_enriched_website
+- leads_scored
+- tasks_created
+- tasks_completed
+- errors
+
+Execution (OutreachAttempts):
+- attempts_total
+- replies
+- meetings
+
+Note: Some older campaign runs created before these fields existed may show null for replies/meetings; the server now initializes these when logging attempts, and the UI should treat missing as 0 for safety.
 
 2.2 Lead
 A Lead is the normalized object created from each CSV row.
@@ -254,6 +272,7 @@ Event types you’ll see in practice:
 - lead.scored
 - lead.tasks_created
 - task.completed
+- attempt.logged (created when real-world outreach execution is logged)
 
 5.3 Leads
 - GET /v1/campaign-runs/{id}/leads
@@ -278,24 +297,71 @@ Event types you’ll see in practice:
   When status becomes "done", the API increments tasks_completed and emits task.completed event.
 
 5.5 OutreachAttempts (execution logging)
-- POST /v1/outreach-attempts
-  Log what actually happened (email sent, reply received, bounced, meeting booked, etc.).
-  Emits event: attempt.logged
+Two endpoints exist:
+- POST /v1/attempts (recommended)
+  - Purpose: dead-simple execution logging for ops/programmatic use.
+  - Behavior:
+    - inserts an OutreachAttempt (oa_...)
+    - emits event: attempt.logged
+    - updates CampaignRun.progress rollups:
+      attempts_total += 1
+      replies += 1 for outcomes: replied|positive|negative|meeting_booked
+      meetings += 1 for outcome: meeting_booked
+  - Response: 201 Created
 
+- POST /v1/outreach-attempts (back-compat)
+  - Same behavior, returns 200.
+
+List attempts:
 - GET /v1/outreach-attempts
   Query params:
   - campaign_run_id
   - lead_id
   - limit
 
-5.5 Metrics
+OutreachAttempt payload shape (example)
+{
+  "campaign_run_id": "cr_xxx",
+  "lead_id": "ld_xxx",
+  "channel": "email",
+  "template_id": "E1_MANDATE_SALEONLY",
+  "executed_at": "2026-02-06T15:04:00Z",
+  "outcome_code": "sent",
+  "outcome_notes": "Initial outreach email sent"
+}
+
+5.6 Metrics
 - GET /v1/metrics/overview
-  Returns:
+  Existing planning metrics remain:
   - leads_total
   - tiers {A,B,C,D}
   - tasks_total
   - tasks_done
   - task_completion_rate
+
+  Outcome/execution metrics (client-facing):
+  - attempts_total
+  - attempts_by_channel {email, phone, linkedin, other}
+  - replies_total (outcome_code in replied|positive|negative|meeting_booked)
+  - positive_replies_total (outcome_code in positive|meeting_booked)
+  - meetings_total (outcome_code=meeting_booked)
+  - bounces_total (outcome_code=bounced)
+  - unsubscribes_total (outcome_code=unsubscribed)
+  - bounce_rate = bounces_total / attempts_total
+  - reply_rate = replies_total / attempts_total
+  - meeting_rate = meetings_total / attempts_total
+
+  Last 7 days (based on executed_at >= last_7d_cutoff_utc):
+  - attempts_last_7d
+  - replies_last_7d
+  - meetings_last_7d
+  - reply_rate_last_7d
+  - meeting_rate_last_7d
+  - last_7d_cutoff_utc
+
+  Notes:
+  - Metrics are computed dynamically from OutreachAttempt rows (no cached rollups needed in this POC).
+  - When showing rates, guard against attempts_total=0.
 
 
 6) Lovable frontend: recommended screens/components
@@ -397,13 +463,22 @@ F) Show tasks created
 
 G) Admin marks tasks done
 - Toggle some tasks to done.
-- Show metrics update and task.completed events.
+- Show task-based metrics update and task.completed events.
+
+H) Ops logs real-world execution (this is the paid-service proof)
+- Use POST /v1/attempts to log an email sent, a reply, a bounce, and a meeting booked.
+- Show:
+  - attempt.logged events
+  - /v1/outreach-attempts list
+  - /v1/metrics/overview outcome metrics (attempts_total, reply_rate, meetings_total, bounce_rate, last_7d)
 
 
 8) Known limitations / POC notes (be explicit in demo)
 
 - Scoring is a deterministic stub (location/size/industry). It’s intentionally simple and explainable.
 - Google Places enrichment requires GOOGLE_MAPS_API_KEY. Without it, places enrichment is skipped.
+  - The run emits a progress payload field places_enabled so the UI can show Enabled/Disabled explicitly.
+  - Places results are cached in SQLite (TTL ~30 days) to reduce jitter and rate-limit issues during demos.
 - Website enrichment is a single-page fetch; not a crawler.
 - No true LLM extraction in the POC.
 - SQLite is used for persistence (DB_PATH env var; Render uses a disk path like /var/data/poc.db).
@@ -440,6 +515,14 @@ Mark task done:
 curl -sS -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"status":"done","completion":{"completed_at":"2026-02-05T15:00:00Z","outcome_code":"sent","outcome_notes":"Sent"}}' \
   "$BASE/v1/tasks/<TASK_ID>"
+
+Log execution attempt (201):
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"campaign_run_id":"<RUN_ID>","lead_id":"<LEAD_ID>","channel":"email","template_id":"E1_MANDATE_SALEONLY","executed_at":"2026-02-06T15:04:00Z","outcome_code":"sent","outcome_notes":"Initial outreach email sent"}' \
+  "$BASE/v1/attempts"
+
+List execution attempts:
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/outreach-attempts?campaign_run_id=<RUN_ID>&lead_id=<LEAD_ID>&limit=5"
 
 Metrics:
 curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/metrics/overview?campaign_run_id=<RUN_ID>"
