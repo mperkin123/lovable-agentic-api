@@ -116,6 +116,18 @@ def init_db():
           raw_json text,
           fetched_at text
         );
+
+        create table if not exists outreach_attempts (
+          id text primary key,
+          campaign_run_id text,
+          lead_id text,
+          channel text,
+          template_id text,
+          executed_at text,
+          outcome_code text,
+          outcome_notes text,
+          created_at text
+        );
         """
     )
     conn.commit()
@@ -170,6 +182,16 @@ def update_campaign_run(campaign_run_id: str, *, status: Optional[str] = None, p
 class CampaignRunCreate(BaseModel):
     name: str
     criteria: Dict[str, Any]
+
+
+class OutreachAttemptCreate(BaseModel):
+    campaign_run_id: str
+    lead_id: str
+    channel: str  # email|phone|linkedin|other
+    template_id: Optional[str] = None
+    executed_at: str
+    outcome_code: str  # sent|delivered|replied|positive|negative|meeting_booked|bounced|unsubscribed
+    outcome_notes: Optional[str] = None
 
 
 app = FastAPI(title="Lovable Agentic API (POC)")
@@ -1010,6 +1032,105 @@ def list_tasks(campaign_run_id: Optional[str] = None, status: Optional[str] = No
             }
         )
     return {"tasks": out}
+
+
+@app.post("/v1/outreach-attempts", dependencies=[Depends(auth)])
+def create_outreach_attempt(body: OutreachAttemptCreate):
+    # basic validation
+    allowed_channels = {"email", "phone", "linkedin", "other"}
+    allowed_outcomes = {"sent", "delivered", "replied", "positive", "negative", "meeting_booked", "bounced", "unsubscribed"}
+    if body.channel not in allowed_channels:
+        raise HTTPException(400, f"Invalid channel: {body.channel}")
+    if body.outcome_code not in allowed_outcomes:
+        raise HTTPException(400, f"Invalid outcome_code: {body.outcome_code}")
+
+    # ensure campaign + lead exist
+    _ = get_campaign_run(body.campaign_run_id)
+    conn = db()
+    lead_row = conn.execute("select id from leads where id=? and campaign_run_id=?", (body.lead_id, body.campaign_run_id)).fetchone()
+    if not lead_row:
+        conn.close()
+        raise HTTPException(404, "Lead not found for campaign run")
+
+    oid = f"oa_{uuid.uuid4().hex}"
+    conn.execute(
+        "insert into outreach_attempts (id,campaign_run_id,lead_id,channel,template_id,executed_at,outcome_code,outcome_notes,created_at) values (?,?,?,?,?,?,?,?,?)",
+        (
+            oid,
+            body.campaign_run_id,
+            body.lead_id,
+            body.channel,
+            body.template_id,
+            body.executed_at,
+            body.outcome_code,
+            body.outcome_notes,
+            now_iso(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    emit_event(
+        body.campaign_run_id,
+        "attempt.logged",
+        "Outreach attempt logged",
+        {
+            "outreach_attempt_id": oid,
+            "lead_id": body.lead_id,
+            "channel": body.channel,
+            "template_id": body.template_id,
+            "executed_at": body.executed_at,
+            "outcome_code": body.outcome_code,
+        },
+        lead_id=body.lead_id,
+    )
+
+    return {
+        "id": oid,
+        "campaign_run_id": body.campaign_run_id,
+        "lead_id": body.lead_id,
+        "channel": body.channel,
+        "template_id": body.template_id,
+        "executed_at": body.executed_at,
+        "outcome_code": body.outcome_code,
+        "outcome_notes": body.outcome_notes,
+    }
+
+
+@app.get("/v1/outreach-attempts", dependencies=[Depends(auth)])
+def list_outreach_attempts(campaign_run_id: Optional[str] = None, lead_id: Optional[str] = None, limit: int = 200):
+    conn = db()
+    sql = "select * from outreach_attempts where 1=1"
+    params: List[Any] = []
+    if campaign_run_id:
+        sql += " and campaign_run_id=?"
+        params.append(campaign_run_id)
+    if lead_id:
+        sql += " and lead_id=?"
+        params.append(lead_id)
+    sql += " order by executed_at desc, created_at desc limit ?"
+    params.append(limit)
+
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    conn.close()
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "id": r["id"],
+                "campaign_run_id": r["campaign_run_id"],
+                "lead_id": r["lead_id"],
+                "channel": r["channel"],
+                "template_id": r["template_id"],
+                "executed_at": r["executed_at"],
+                "outcome_code": r["outcome_code"],
+                "outcome_notes": r["outcome_notes"],
+                "created_at": r["created_at"],
+            }
+        )
+
+    return {"outreach_attempts": out}
 
 
 @app.patch("/v1/tasks/{task_id}", dependencies=[Depends(auth)])
