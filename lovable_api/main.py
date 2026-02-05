@@ -25,6 +25,9 @@ API_TOKEN = os.environ.get("API_TOKEN", "dev-token")
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+# throttle OpenAI calls to avoid 429s when processing many leads
+OPENAI_MIN_INTERVAL_MS = int(os.environ.get("OPENAI_MIN_INTERVAL_MS", "750"))
+OPENAI_MAX_RETRIES = int(os.environ.get("OPENAI_MAX_RETRIES", "3"))
 
 # Lovable-friendly CORS:
 # - Set CORS_ALLOW_ORIGINS="https://your-lovable-app.com,https://another-origin.com"
@@ -706,8 +709,29 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+_openai_lock = threading.Lock()
+_openai_last_call_at = 0.0
+
+
+def _openai_throttle():
+    global _openai_last_call_at
+    if OPENAI_MIN_INTERVAL_MS <= 0:
+        return
+    with _openai_lock:
+        now = time.time()
+        wait_s = (_openai_last_call_at + (OPENAI_MIN_INTERVAL_MS / 1000.0)) - now
+        if wait_s > 0:
+            time.sleep(wait_s)
+        _openai_last_call_at = time.time()
+
+
 def _llm_business_profile(evidence: Dict[str, Any]) -> Dict[str, Any]:
-    """Call OpenAI if configured; otherwise return defaults."""
+    """Call OpenAI if configured; otherwise return defaults.
+
+    Notes:
+    - We process leads sequentially, but still throttle to avoid 429s.
+    - On 429, we retry with backoff a few times, then default.
+    """
     evidence_used = evidence.get("evidence_used") or []
     if not OPENAI_API_KEY:
         return _bp_default(evidence_used)
@@ -734,28 +758,73 @@ def _llm_business_profile(evidence: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     try:
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": OPENAI_MODEL,
-                "temperature": 0.2,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": json.dumps(user)},
-                ],
-                "response_format": {"type": "json_object"},
-            },
-            timeout=45,
-        )
-        r.raise_for_status()
-        data = r.json()
-        content = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
-        parsed = _extract_json_object(content)
-        if not parsed:
-            out = _bp_default(evidence_used)
-            out["raw_llm_json"] = content[:50_000]
-            return out
+        last_err: Optional[str] = None
+        for attempt in range(OPENAI_MAX_RETRIES):
+            _openai_throttle()
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": OPENAI_MODEL,
+                    "temperature": 0.2,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": json.dumps(user)},
+                    ],
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=45,
+            )
+
+            if r.status_code == 429:
+                # backoff and retry
+                sleep_s = min(8.0, 0.75 * (2**attempt))
+                last_err = f"429 rate_limited (attempt {attempt+1}/{OPENAI_MAX_RETRIES})"
+                time.sleep(sleep_s)
+                continue
+
+            if r.status_code >= 400:
+                # non-retryable for this POC
+                try:
+                    last_err = json.dumps((r.json() or {}).get("error") or {})[:800]
+                except Exception:
+                    last_err = (r.text or "")[:800]
+                break
+
+            data = r.json()
+            content = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+            parsed = _extract_json_object(content)
+            if not parsed:
+                out = _bp_default(evidence_used)
+                out["raw_llm_json"] = content[:50_000]
+                return out
+
+            # normalize/guard
+            vc = (parsed.get("vertical_category") or "unknown").strip()
+            if vc not in BUSINESS_CATEGORIES:
+                vc = "unknown"
+            conf = parsed.get("confidence")
+            try:
+                conf_f = float(conf)
+            except Exception:
+                conf_f = 0.2
+            conf_f = max(0.0, min(1.0, conf_f))
+
+            return {
+                "vertical_category": vc,
+                "services": [str(x) for x in (parsed.get("services") or [])][:50],
+                "customer_type": (parsed.get("customer_type") or "unknown"),
+                "buyer_persona_hint": parsed.get("buyer_persona_hint"),
+                "credibility_signals": [str(x) for x in (parsed.get("credibility_signals") or [])][:50],
+                "confidence": conf_f,
+                "evidence_used": [str(x) for x in (parsed.get("evidence_used") or evidence_used)],
+                "raw_llm_json": content[:50_000],
+            }
+
+        # fallthrough: default
+        out = _bp_default(evidence_used)
+        out["raw_llm_json"] = f"error: {last_err or 'openai_failed'}"
+        return out
 
         # normalize/guard
         vc = (parsed.get("vertical_category") or "unknown").strip()
