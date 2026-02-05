@@ -407,7 +407,21 @@ def _runner(campaign_run_id: str):
     leads = conn.execute("select id, lead_json from leads where campaign_run_id=?", (campaign_run_id,)).fetchall()
     conn.close()
 
-    prog = cr["progress"]
+    # Reset progress for this attempt so counters don't inflate across reruns.
+    # (We still do not delete leads/tasks/events here; use a fresh campaign run for perfectly clean state.)
+    prev = cr.get("progress") or {}
+    prog = {
+        "seed_rows_total": int(prev.get("seed_rows_total") or 0),
+        "leads_created": int(prev.get("leads_created") or 0),
+        "leads_enriched_places": 0,
+        "leads_enriched_website": 0,
+        "leads_scored": 0,
+        "tasks_created": 0,
+        "tasks_completed": int(prev.get("tasks_completed") or 0),
+        "errors": 0,
+    }
+    update_campaign_run(campaign_run_id, progress=prog)
+    emit_event(campaign_run_id, "progress", "Progress reset for run attempt", {"progress": prog})
 
     for row in leads:
         lead_id = row["id"]
@@ -440,7 +454,7 @@ def _runner(campaign_run_id: str):
                     },
                 }
             )
-            prog["leads_enriched_places"] += 1
+            prog["leads_enriched_places"] = min(prog["leads_enriched_places"] + 1, prog.get("seed_rows_total") or prog["leads_enriched_places"] + 1)
             emit_event(
                 campaign_run_id,
                 "lead.places_enriched",
@@ -465,7 +479,7 @@ def _runner(campaign_run_id: str):
                     "snippets": [{"quote": text[:300], "label": "homepage_text_sample"}],
                 }
             )
-            prog["leads_enriched_website"] += 1
+            prog["leads_enriched_website"] = min(prog["leads_enriched_website"] + 1, prog.get("seed_rows_total") or prog["leads_enriched_website"] + 1)
             emit_event(
                 campaign_run_id,
                 "lead.website_enriched",
@@ -482,48 +496,56 @@ def _runner(campaign_run_id: str):
             "components": components,
             "reasoning_bullets": reasons,
         }
-        prog["leads_scored"] += 1
+        prog["leads_scored"] = min(prog["leads_scored"] + 1, prog.get("seed_rows_total") or prog["leads_scored"] + 1)
         emit_event(campaign_run_id, "lead.scored", "Lead scored", {"total": total, "tier": tier}, lead_id=lead_id)
 
         # Tasks for A/B
         if tier in ("A", "B"):
-            tasks = _generate_tasks_stub(campaign_run_id, lead_id, lead)
-            task_ids = []
+            # Avoid duplicating tasks on force reruns
             conn = db()
-            for t in tasks:
-                tid = f"tsk_{uuid.uuid4().hex}"
-                task_ids.append(tid)
-                conn.execute(
-                    "insert into tasks (id,campaign_run_id,lead_id,type,channel,status,due_at_est,window_start_est,window_end_est,instructions,template_id,completion_json,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        tid,
-                        campaign_run_id,
-                        lead_id,
-                        t["type"],
-                        t["channel"],
-                        t["status"],
-                        t.get("due_at_est"),
-                        t.get("window_start_est"),
-                        t.get("window_end_est"),
-                        t.get("instructions"),
-                        t.get("template_id"),
-                        json.dumps({"completed_at": None, "outcome_code": None, "outcome_notes": None}),
-                        now_iso(),
-                        now_iso(),
-                    ),
-                )
-            conn.commit()
+            existing = conn.execute(
+                "select count(1) as c from tasks where campaign_run_id=? and lead_id=?",
+                (campaign_run_id, lead_id),
+            ).fetchone()["c"]
             conn.close()
+            if not existing or int(existing) == 0:
+                tasks = _generate_tasks_stub(campaign_run_id, lead_id, lead)
+                task_ids = []
+                conn = db()
+                for t in tasks:
+                    tid = f"tsk_{uuid.uuid4().hex}"
+                    task_ids.append(tid)
+                    conn.execute(
+                        "insert into tasks (id,campaign_run_id,lead_id,type,channel,status,due_at_est,window_start_est,window_end_est,instructions,template_id,completion_json,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            tid,
+                            campaign_run_id,
+                            lead_id,
+                            t["type"],
+                            t["channel"],
+                            t["status"],
+                            t.get("due_at_est"),
+                            t.get("window_start_est"),
+                            t.get("window_end_est"),
+                            t.get("instructions"),
+                            t.get("template_id"),
+                            json.dumps({"completed_at": None, "outcome_code": None, "outcome_notes": None}),
+                            now_iso(),
+                            now_iso(),
+                        ),
+                    )
+                conn.commit()
+                conn.close()
 
-            lead["task_ids"] = task_ids
-            prog["tasks_created"] += len(task_ids)
-            emit_event(
-                campaign_run_id,
-                "lead.tasks_created",
-                "Tasks created",
-                {"task_count": len(task_ids)},
-                lead_id=lead_id,
-            )
+                lead["task_ids"] = task_ids
+                prog["tasks_created"] += len(task_ids)
+                emit_event(
+                    campaign_run_id,
+                    "lead.tasks_created",
+                    "Tasks created",
+                    {"task_count": len(task_ids)},
+                    lead_id=lead_id,
+                )
 
         # Persist lead
         conn = db()
@@ -607,7 +629,17 @@ def _runner(campaign_run_id: str):
 
 
 @app.post("/v1/campaign-runs/{campaign_run_id}/run", dependencies=[Depends(auth)])
-def run_campaign(campaign_run_id: str):
+def run_campaign(campaign_run_id: str, force: bool = False):
+    cr = get_campaign_run(campaign_run_id)
+
+    # Prevent concurrent runs (these inflate counters + duplicate events)
+    if cr.get("status") == "running":
+        raise HTTPException(status_code=409, detail="Campaign run is already running")
+
+    # Avoid accidental re-runs of completed jobs unless explicitly forced
+    if cr.get("status") == "complete" and not force:
+        raise HTTPException(status_code=409, detail="Campaign run already complete (pass force=true to rerun)")
+
     # fire-and-forget thread
     t = threading.Thread(target=_runner, args=(campaign_run_id,), daemon=True)
     t.start()
