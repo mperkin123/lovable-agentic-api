@@ -19,7 +19,7 @@ components:
         name: { type: string }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
-        status: { type: string, enum: [draft, running, paused, complete, failed] }
+        status: { type: string, enum: [draft, running, paused, complete, failed, aborted] }
         criteria:
           type: object
           properties:
@@ -190,12 +190,12 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CampaignRun' }
-  /v1/campaign-runs/{id}:
+  /v1/campaign-runs/{campaign_run_id}:
     get:
       summary: Get campaign run
       parameters:
         - in: path
-          name: id
+          name: campaign_run_id
           required: true
           schema: { type: string }
       responses:
@@ -204,12 +204,37 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CampaignRun' }
-  /v1/campaign-runs/{id}/import/seed-csv:
+
+  /v1/campaign-runs/{campaign_run_id}/abort:
+    post:
+      summary: Abort campaign run
+      description: Marks a stuck/running campaign run as aborted.
+      parameters:
+        - in: path
+          name: campaign_run_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignRun' }
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail: { type: string }
+
+  /v1/campaign-runs/{campaign_run_id}/import/seed-csv:
     post:
       summary: Import seed CSV
       parameters:
         - in: path
-          name: id
+          name: campaign_run_id
           required: true
           schema: { type: string }
       requestBody:
@@ -231,12 +256,12 @@ paths:
                 type: object
                 properties:
                   imported: { type: integer }
-  /v1/campaign-runs/{id}/run:
+  /v1/campaign-runs/{campaign_run_id}/run:
     post:
       summary: Start pipeline
       parameters:
         - in: path
-          name: id
+          name: campaign_run_id
           required: true
           schema: { type: string }
       responses:
@@ -245,12 +270,12 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CampaignRun' }
-  /v1/campaign-runs/{id}/events:
+  /v1/campaign-runs/{campaign_run_id}/events:
     get:
       summary: Poll events
       parameters:
         - in: path
-          name: id
+          name: campaign_run_id
           required: true
           schema: { type: string }
         - in: query
@@ -273,12 +298,12 @@ paths:
                     type: array
                     items: { $ref: '#/components/schemas/Event' }
                   nextCursor: { type: string, nullable: true }
-  /v1/campaign-runs/{id}/leads:
+  /v1/campaign-runs/{campaign_run_id}/leads:
     get:
       summary: List leads
       parameters:
         - in: path
-          name: id
+          name: campaign_run_id
           required: true
           schema: { type: string }
         - in: query

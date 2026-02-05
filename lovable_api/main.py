@@ -205,6 +205,14 @@ def update_campaign_run(campaign_run_id: str, *, status: Optional[str] = None, p
     conn.close()
 
 
+def get_campaign_run_status(campaign_run_id: str) -> Optional[str]:
+    """Fast status check used by the background runner."""
+    conn = db()
+    row = conn.execute("select status from campaign_runs where id=?", (campaign_run_id,)).fetchone()
+    conn.close()
+    return (row["status"] if row else None)
+
+
 class CampaignRunCreate(BaseModel):
     name: str
     criteria: Dict[str, Any]
@@ -382,6 +390,31 @@ def list_campaign_runs(limit: int = 50, cursor: Optional[str] = None, status: Op
 
 @app.get("/v1/campaign-runs/{campaign_run_id}", dependencies=[Depends(auth)])
 def campaign_run_get(campaign_run_id: str):
+    return get_campaign_run(campaign_run_id)
+
+
+@app.post("/v1/campaign-runs/{campaign_run_id}/abort", dependencies=[Depends(auth)])
+def abort_campaign_run(campaign_run_id: str):
+    """Abort a stuck/running CampaignRun.
+
+    This is an admin escape hatch for demos:
+    - Marks status=aborted
+    - Emits a campaign.aborted event
+
+    Notes:
+    - If the background runner is still alive, it will notice and exit.
+    - If it already crashed, this clears the stuck status so UIs can recover.
+    """
+    cr = get_campaign_run(campaign_run_id)
+    if cr.get("status") == "complete":
+        raise HTTPException(status_code=409, detail="Campaign run already complete")
+
+    # idempotent
+    if cr.get("status") == "aborted":
+        return cr
+
+    update_campaign_run(campaign_run_id, status="aborted")
+    emit_event(campaign_run_id, "campaign.aborted", "Campaign aborted", {"status": "aborted"})
     return get_campaign_run(campaign_run_id)
 
 
@@ -1025,6 +1058,11 @@ def _runner(campaign_run_id: str):
     emit_event(campaign_run_id, "progress", "Progress reset for run attempt", {"progress": prog})
 
     for row in leads:
+        # Allow abort from API.
+        if get_campaign_run_status(campaign_run_id) == "aborted":
+            emit_event(campaign_run_id, "progress", "Run aborted", {"status": "aborted", "progress": prog})
+            return
+
         lead_id = row["id"]
         lead = json.loads(row["lead_json"])
 
@@ -1246,6 +1284,10 @@ def _runner(campaign_run_id: str):
         conn.close()
 
         for r in top_rows:
+            if get_campaign_run_status(campaign_run_id) == "aborted":
+                emit_event(campaign_run_id, "progress", "Run aborted", {"status": "aborted", "progress": prog})
+                return
+
             lead_id = r["id"]
             lead = json.loads(r["lead_json"])
 
@@ -1300,6 +1342,10 @@ def _runner(campaign_run_id: str):
             )
 
         update_campaign_run(campaign_run_id, progress=prog)
+
+    if get_campaign_run_status(campaign_run_id) == "aborted":
+        emit_event(campaign_run_id, "progress", "Run aborted", {"status": "aborted", "progress": prog})
+        return
 
     update_campaign_run(campaign_run_id, status="complete", progress=prog)
     emit_event(campaign_run_id, "progress", "Run complete", {"status": "complete", "progress": prog})
