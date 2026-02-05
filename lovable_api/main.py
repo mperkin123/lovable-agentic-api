@@ -1075,11 +1075,14 @@ def _log_outreach_attempt(body: OutreachAttemptCreate) -> Dict[str, Any]:
 
     # Update campaign progress counters (if present)
     prog = cr.get("progress") or {}
+    # ensure keys exist for consistent UI (older runs may not have these counters yet)
     prog["attempts_total"] = int(prog.get("attempts_total") or 0) + 1
+    prog["replies"] = int(prog.get("replies") or 0)
+    prog["meetings"] = int(prog.get("meetings") or 0)
     if body.outcome_code in {"replied", "positive", "negative", "meeting_booked"}:
-        prog["replies"] = int(prog.get("replies") or 0) + 1
+        prog["replies"] += 1
     if body.outcome_code == "meeting_booked":
-        prog["meetings"] = int(prog.get("meetings") or 0) + 1
+        prog["meetings"] += 1
     update_campaign_run(body.campaign_run_id, progress=prog)
 
     emit_event(
