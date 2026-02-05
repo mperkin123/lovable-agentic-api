@@ -122,6 +122,33 @@ components:
         created_at: { type: string, format: date-time }
 paths:
   /v1/campaign-runs:
+    get:
+      summary: List campaign runs
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, default: 50 }
+        - in: query
+          name: cursor
+          required: false
+          schema: { type: string }
+        - in: query
+          name: status
+          required: false
+          schema: { type: string, description: 'Comma-separated statuses' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/CampaignRun' }
+                  nextCursor: { type: string, nullable: true }
     post:
       summary: Create campaign run
       requestBody:

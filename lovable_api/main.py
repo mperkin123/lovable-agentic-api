@@ -231,6 +231,67 @@ def create_campaign_run(body: CampaignRunCreate):
     return get_campaign_run(cid)
 
 
+def _parse_runs_cursor(cursor: Optional[str]) -> Optional[Tuple[str, str]]:
+    """Cursor format: <created_at>|<id>"""
+    if not cursor:
+        return None
+    if "|" not in cursor:
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+    created_at, rid = cursor.split("|", 1)
+    if not created_at or not rid:
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+    return created_at, rid
+
+
+@app.get("/v1/campaign-runs", dependencies=[Depends(auth)])
+def list_campaign_runs(limit: int = 50, cursor: Optional[str] = None, status: Optional[str] = None):
+    # newest first
+    limit = max(1, min(int(limit or 50), 200))
+    statuses = [s.strip() for s in (status or "").split(",") if s.strip()]
+
+    where = "where 1=1"
+    params: List[Any] = []
+    if statuses:
+        where += " and status in (%s)" % ",".join(["?"] * len(statuses))
+        params.extend(statuses)
+
+    cur = _parse_runs_cursor(cursor)
+    if cur:
+        cur_created, cur_id = cur
+        # strictly older than cursor tuple (created_at desc, id desc)
+        where += " and (created_at < ? or (created_at = ? and id < ?))"
+        params.extend([cur_created, cur_created, cur_id])
+
+    conn = db()
+    rows = conn.execute(
+        f"select * from campaign_runs {where} order by created_at desc, id desc limit ?",
+        tuple(params + [limit + 1]),
+    ).fetchall()
+    conn.close()
+
+    sliced = rows[:limit]
+    items = []
+    for r in sliced:
+        items.append(
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "status": r["status"],
+                "criteria": json.loads(r["criteria_json"] or "{}"),
+                "progress": json.loads(r["progress_json"] or "{}"),
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            }
+        )
+
+    next_cursor = None
+    if len(rows) > limit and sliced:
+        last = sliced[-1]
+        next_cursor = f"{last['created_at']}|{last['id']}"
+
+    return {"items": items, "nextCursor": next_cursor}
+
+
 @app.get("/v1/campaign-runs/{campaign_run_id}", dependencies=[Depends(auth)])
 def campaign_run_get(campaign_run_id: str):
     return get_campaign_run(campaign_run_id)
