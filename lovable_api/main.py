@@ -536,6 +536,72 @@ def _runner(campaign_run_id: str):
 
         update_campaign_run(campaign_run_id, progress=prog)
 
+    # If no A/B tasks were created, create tasks for top leads anyway (POC default)
+    if prog.get("tasks_created", 0) == 0:
+        top_n = int(os.environ.get("TASK_TOP_N", "25"))
+        conn = db()
+        top_rows = conn.execute(
+            "select id, lead_json from leads where campaign_run_id=? order by coalesce(score_total, -1) desc, id asc limit ?",
+            (campaign_run_id, top_n),
+        ).fetchall()
+        conn.close()
+
+        for r in top_rows:
+            lead_id = r["id"]
+            lead = json.loads(r["lead_json"])
+
+            # skip if tasks already exist
+            conn = db()
+            existing = conn.execute("select count(1) as c from tasks where lead_id=?", (lead_id,)).fetchone()["c"]
+            conn.close()
+            if existing and int(existing) > 0:
+                continue
+
+            tasks = _generate_tasks_stub(campaign_run_id, lead_id, lead)
+            task_ids: List[str] = []
+            conn = db()
+            for t in tasks:
+                tid = f"tsk_{uuid.uuid4().hex}"
+                task_ids.append(tid)
+                conn.execute(
+                    "insert into tasks (id,campaign_run_id,lead_id,type,channel,status,due_at_est,window_start_est,window_end_est,instructions,template_id,completion_json,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        tid,
+                        campaign_run_id,
+                        lead_id,
+                        t["type"],
+                        t["channel"],
+                        t["status"],
+                        t.get("due_at_est"),
+                        t.get("window_start_est"),
+                        t.get("window_end_est"),
+                        t.get("instructions"),
+                        t.get("template_id"),
+                        json.dumps({"completed_at": None, "outcome_code": None, "outcome_notes": None}),
+                        now_iso(),
+                        now_iso(),
+                    ),
+                )
+            conn.commit()
+            conn.close()
+
+            lead["task_ids"] = task_ids
+            conn = db()
+            conn.execute("update leads set lead_json=?, updated_at=? where id=?", (json.dumps(lead), now_iso(), lead_id))
+            conn.commit()
+            conn.close()
+
+            prog["tasks_created"] += len(task_ids)
+            emit_event(
+                campaign_run_id,
+                "lead.tasks_created",
+                "Tasks created",
+                {"task_count": len(task_ids), "reason": "fallback_top_n"},
+                lead_id=lead_id,
+            )
+
+        update_campaign_run(campaign_run_id, progress=prog)
+
     update_campaign_run(campaign_run_id, status="complete", progress=prog)
     emit_event(campaign_run_id, "progress", "Run complete", {"status": "complete", "progress": prog})
 
